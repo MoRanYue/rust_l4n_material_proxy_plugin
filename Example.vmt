@@ -1,0 +1,106 @@
+// =====================================================================
+// Example.vmt —— 演示 rust_l4n_material_proxy_plugin 注册的自定义材质代理
+//
+// 用法：
+//   1. 把本文件放到游戏材质目录（如 addons/xxx/materials/Example.vmt），
+//      由模型 / 表面 / 控制台 "mat_reloadallmaterials" 引用后生效；
+//   2. 插件 DLL 必须已部署到 left4neko 插件目录（见 AGENTS.md）。
+//
+// 代理名、参数与逆向依据见 AGENTS.md。
+//
+// 说明：
+//   - 插件 hook 引擎的 "Proxies" 解析函数，命中代理名后调用 Rust 回调并**摘除**该节点，
+//     因此本文件里的自定义代理（l4nrp_*）可与原版/L4N 代理（Sine/Multiply 等）共存于同一块。
+//   - 日志里 `is_in_range[...]` / `print_variable[...]` 方括号内为材质名（material::get_name，
+//     即本文件去掉 .vmt 后的路径，如 "Example"）。
+// =====================================================================
+"UnlitGeneric"
+{
+    // 基础设置
+    "$basetexture" "vgui/common/l4d_spinner"
+    "$color" "[1 1 1]" // l4nrp_force_red 会把它写成 (1,0,0) 使材质变红
+
+    // l4nrp_does_equal 的输入 / 输出变量（必须在 VMT 声明，FindVar 才有效）
+    "$src_var_1" "1.0"
+    "$src_var_2" "1.0"
+    "$result_var" "0"
+    "$compare_result" "0" // l4nrp_compare 输出（与 does_equal 分开，避免同写 $result_var）
+
+    // l4nrp_is_in_range 的输入 / 输出变量
+    "$src_var"   "0.5"
+    "$min_var"   "0.0"
+    "$max_var"   "1.0"
+    "$result_var2" "0"
+
+    // l4nrp_print_variable 的输入变量（标量 / 向量各一个）
+    "$var"    "0.5"
+    "$varvec" "[0.1 0.2 0.3]"
+
+    "Proxies"
+    {
+        // 1) l4nrp_color_ramp —— 演示可配置参数（打印到日志）
+        "l4nrp_color_ramp"
+        {
+            "color_r" "1.0"
+            "color_g" "0.5"
+            "color_b" "0.25"
+            "rate"   "2.0"
+            "scale"  "1.5"
+            "flag"   "1"
+            "text"   "hello from Example.vmt"
+        }
+
+        // 2) l4nrp_log_pulse —— 演示带 enabled 开关的参数（flag=1 才打印）
+        "l4nrp_log_pulse"
+        {
+            "flag"    "1"
+            "color_b" "0.8"
+            "rate"    "1.0"
+        }
+
+        // 3) l4nrp_force_red —— 无参数；把 $color 写成纯红 (1,0,0)
+        "l4nrp_force_red"
+        {}
+
+        // 4) l4nrp_does_equal —— 每帧比较 $src_var_1 与 $src_var_2，
+        //    相等则 $result_var = 1，否则 = 0
+        "l4nrp_does_equal"
+        {
+            "src_a"  "$src_var_1"
+            "src_b"  "$src_var_2"
+            "result" "$result_var"
+        }
+
+        // 5) l4nrp_compare —— 每帧三态比较 $src_var_1 与 $src_var_2（相对容差 1e-6）：
+        //    a==b → $compare_result = 0；a>b → 1；a<b → -1
+        "l4nrp_compare"
+        {
+            "src_a"  "$src_var_1"
+            "src_b"  "$src_var_2"
+            "result" "$compare_result"
+        }
+
+        // 6) l4nrp_is_in_range —— 每帧检查 $src_var 是否落在 [min,max] 内，
+        //    是则 $result_var2 = 1，否则 = 0
+        "l4nrp_is_in_range"
+        {
+            "src"    "$src_var"
+            "min"    "$min_var"
+            "max"    "$max_var"
+            "result" "$result_var2"
+        }
+
+        // 7) l4nrp_print_variable —— 每帧读取变量并打印到日志
+        //    type 可配置：float（默认）/ int / vector（数值与向量分开处理）
+        "l4nrp_print_variable"
+        {
+            "var"  "$var"     // 要读取的变量名
+            "type" "float"    // 标量：打印 ... =0.5000 (float)
+        }
+        "l4nrp_print_variable"
+        {
+            "var"  "$varvec"  // 向量示例
+            "type" "vector"   // 打印 ... =0.1000,0.2000,0.3000 (vec)
+        }
+    }
+}
