@@ -16,7 +16,7 @@ use std::ffi::CString;
 use std::sync::OnceLock;
 
 use kv::Proxy;
-use util::RelativeCompare;
+use util::{RelativeCompare, EPS};
 
 // ---------------------------------------------------------------------------
 // IL4NPlugin 虚表（与 bin/neko/plugins/l4n_plugin.h 一致）
@@ -237,7 +237,7 @@ impl Proxy for DoesEqualProxy {
             // 材质失效/变量缺失 → 从活动表移除
             return false;
         }
-        let v = if (a - b).abs() < 1e-6 { 1 } else { 0 };
+        let v = if (a - b).abs() < EPS { 1 } else { 0 };
         material::set_int(out, v);
         #[cfg(debug_assertions)]
         {
@@ -416,14 +416,21 @@ impl VarType {
 struct PrintVariable {
     var: String,
     var_type: VarType,
-    // 缓存变量名，避免每帧堆分配（apply_kv 更新时重建）
+    last_float: f32,
+    last_int: i32,
+    last_vec3: [f32; 3],
+    last_str: String,
     var_n: CString,
 }
 impl Default for PrintVariable {
     fn default() -> Self {
-        PrintVariable {
+        Self {
             var: "$var".into(),
             var_type: VarType::Float,
+            last_float: f32::NAN,
+            last_int: i32::MIN,
+            last_vec3: [f32::NAN; 3],
+            last_str: String::new(),
             var_n: cstr_of("$var"),
         }
     }
@@ -453,27 +460,41 @@ impl Proxy for PrintVariable {
         match self.var_type {
             // ---- 向量：get_vec 读三分量 ----
             VarType::Vector => {
-                let mut o = [0.0f32; 3];
+                let mut o = [f32::NAN; 3];
                 material::get_vec(var, &mut o);
-                log(&format!(
-                    "print_variable[{}]: {}={:.4},{:.4},{:.4} (vec)",
-                    mat_name, self.var, o[0], o[1], o[2]
-                ));
+                if (o[0] - self.last_vec3[0]).abs() > EPS ||
+                    (o[1] - self.last_vec3[1]).abs() > EPS ||
+                    (o[2] - self.last_vec3[2]).abs() > EPS {
+                    log(&format!(
+                        "print_variable[{}]: {}={:.4},{:.4},{:.4} (vec)",
+                        mat_name, self.var, o[0], o[1], o[2]
+                    ));
+                    self.last_vec3 = o;
+                }
             }
             // ---- 整数：get_int 直接读整数值（vtable +0x68）----
             VarType::Int => {
                 let v = material::get_int(var);
-                log(&format!("print_variable[{}]: {}={v} (int)", mat_name, self.var));
+                if v != self.last_int {
+                    log(&format!("print_variable[{}]: {}={v} (int)", mat_name, self.var));
+                    self.last_int = v;
+                }
             }
             // ---- 字符串：get_string 读字符串（vtable +0x18）----
             VarType::String => {
                 let s = material::get_string(var).unwrap_or_else(|| "<null>".into());
-                log(&format!("print_variable[{}]: {}='{s}' (str)", mat_name, self.var));
+                if s != self.last_str {
+                    log(&format!("print_variable[{}]: {}='{s}' (str)", mat_name, self.var));
+                    self.last_str = s;
+                }
             }
             // ---- 标量浮点 ----
             VarType::Float => {
                 let v = material::get_float(var);
-                log(&format!("print_variable[{}]: {}={v:.4} (float)", mat_name, self.var));
+                if (v - self.last_float).abs() > EPS {
+                    log(&format!("print_variable[{}]: {}={v:.4} (float)", mat_name, self.var));
+                    self.last_float = v;
+                }
             }
         }
         true
@@ -628,6 +649,77 @@ impl Proxy for StrReplaceProxy {
     }
 }
 
+/// l4nrp_vec3 —— 将 3 个浮点数变量作为分量组成 3 维向量。
+struct Vec3Proxy {
+    src_x: String,
+    src_y: String,
+    src_z: String,
+    result: String,
+    last_result: [f32; 3],
+    src_x_n: CString,
+    src_y_n: CString,
+    src_z_n: CString,
+    result_n: CString,
+}
+impl Default for Vec3Proxy {
+    fn default() -> Self {
+        Self {
+            src_x: "$src_x".into(),
+            src_y: "$src_y".into(),
+            src_z: "$src_z".into(),
+            result: "$result_var".into(),
+            last_result: [f32::NAN; 3],
+            src_x_n: cstr_of(""),
+            src_y_n: cstr_of(""),
+            src_z_n: cstr_of(""),
+            result_n: cstr_of("$result_var"),
+        }
+    }
+}
+impl Proxy for Vec3Proxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "src_x" | "src_var_x" | "src_1" | "src_var_1" | "x" => set_kv(&mut self.src_x, &mut self.src_x_n, value),
+            "src_y" | "src_var_y" | "src_2" | "src_var_2" | "y" => set_kv(&mut self.src_y, &mut self.src_y_n, value),
+            "src_z" | "src_var_z" | "src_3" | "src_var_3" | "z" => set_kv(&mut self.src_z, &mut self.src_z_n, value),
+            "result" | "result_var" | "output" => set_kv(&mut self.result, &mut self.result_n, value),
+            _ => {}
+        }
+    }
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+        if material.is_null() {
+            return false;
+        }
+        let x = material::get_float(material::find_var(material, &self.src_x_n));
+        let y = material::get_float(material::find_var(material, &self.src_y_n));
+        let z = material::get_float(material::find_var(material, &self.src_z_n));
+        let out = material::find_var(material, &self.result_n);
+        if out.is_null() {
+            // 材质失效/变量缺失 → 从活动表移除
+            return false;
+        }
+        let o = [x, y, z];
+        material::set_vec(out, &o);
+        #[cfg(debug_assertions)]
+        {
+            if (o[0] - self.last_result[0]).abs() > EPS ||
+                (o[1] - self.last_result[1]).abs() > EPS ||
+                (o[2] - self.last_result[2]).abs() > EPS {
+                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                log(&format!(
+                    "vec3[{}]: {}={x:.4} {}={y:.4} {}={z:.4} -> {}={x:.4},{y:.4},{z:.4}",
+                    mat_name, self.src_x, self.src_y, self.src_z, self.result
+                ));
+                self.last_result = o;
+            }
+        }
+        true
+    }
+}
+
 /// l4nrp_math —— 计算数学表达式，支持读取材质已定义的 VMT 变量（`$var` 或 `var`）。
 ///
 /// 表达式由 [`expr`](expr.rs) 求值器解析：运算符 `+ - * / % ^`、括号、一元负号，以及常用函数
@@ -682,7 +774,7 @@ impl Proxy for MathProxy {
                 material::set_float(out, v);
                 #[cfg(debug_assertions)]
                 {
-                    if (v - self.last_result).abs() > 1e-6 {
+                    if (v - self.last_result).abs() > EPS {
                         let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
                         log(&format!(
                             "math[{}]: {}='{}' = {}",
@@ -756,6 +848,7 @@ unsafe fn try_bind_and_install() {
     material::register_proxy::<PrintVariable>("l4nrp_print_variable");
     material::register_proxy::<StrConcatProxy>("l4nrp_str_concat");
     material::register_proxy::<StrReplaceProxy>("l4nrp_str_replace");
+    material::register_proxy::<Vec3Proxy>("l4nrp_vec3");
     material::register_proxy::<MathProxy>("l4nrp_math");
     log(&format!(
         "registered proxies: {:?}",
