@@ -188,12 +188,12 @@ impl Proxy for ForceRedProxy {
     }
 }
 
-/// l4nrp_does_equal —— 读两个输入变量（变量名可用参数配置），相等则输出 1.0 否则 0.0。
+/// l4nrp_does_equal —— 读两个输入变量（变量名可用参数配置），相等则输出 1 否则 0。
 struct DoesEqualProxy {
     src_a: String,
     src_b: String,
     result: String,
-    last_result: f32,
+    last_result: i32,
     // 缓存变量名，避免每帧堆分配（apply_kv 更新时重建）
     src_a_n: CString,
     src_b_n: CString,
@@ -205,7 +205,7 @@ impl Default for DoesEqualProxy {
             src_a: "$src_var_1".into(),
             src_b: "$src_var_2".into(),
             result: "$result_var".into(),
-            last_result: -1.0,
+            last_result: -1,
             src_a_n: cstr_of("$src_var_1"),
             src_b_n: cstr_of("$src_var_2"),
             result_n: cstr_of("$result_var"),
@@ -236,14 +236,14 @@ impl Proxy for DoesEqualProxy {
             // 材质失效/变量缺失 → 从活动表移除
             return false;
         }
-        let v = if (a - b).abs() < 1e-6 { 1.0 } else { 0.0 };
-        material::set_float(out, v);
+        let v = if (a - b).abs() < 1e-6 { 1 } else { 0 };
+        material::set_int(out, v);
         #[cfg(debug_assertions)]
         {
-            if (v - self.last_result).abs() > 0.5 {
+            if v != self.last_result {
                 let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
                 log(&format!(
-                    "does_equal[{}]: {}={a:.4} {}={b:.4} -> {}={v:.0}",
+                    "does_equal[{}]: {}={a:.4} {}={b:.4} -> {}={v}",
                     mat_name, self.src_a, self.src_b, self.result
                 ));
                 self.last_result = v;
@@ -253,12 +253,12 @@ impl Proxy for DoesEqualProxy {
     }
 }
 
-/// l4nrp_compare —— 读两个输入变量（变量名可用参数配置），a == b => 0.0，a > b => 1.0，a < b => -1.0。
+/// l4nrp_compare —— 读两个输入变量（变量名可用参数配置），a == b => 0，a > b => 1，a < b => -1。
 struct CompareProxy {
     src_a: String,
     src_b: String,
     result: String,
-    last_result: f32,
+    last_result: i32,
     src_a_n: CString,
     src_b_n: CString,
     result_n: CString,
@@ -269,7 +269,7 @@ impl Default for CompareProxy {
             src_a: "$src_var_1".into(),
             src_b: "$src_var_2".into(),
             result: "$result_var".into(),
-            last_result: -1.0,
+            last_result: -1,
             src_a_n: cstr_of("$src_var_1"),
             src_b_n: cstr_of("$src_var_2"),
             result_n: cstr_of("$result_var"),
@@ -300,17 +300,17 @@ impl Proxy for CompareProxy {
             return false;
         }
         let v = match a.relative_cmp(&b) {
-            std::cmp::Ordering::Less => -1.0,
-            std::cmp::Ordering::Equal => 0.0,
-            std::cmp::Ordering::Greater => 1.0
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1
         };
-        material::set_float(out, v);
+        material::set_int(out, v);
         #[cfg(debug_assertions)]
         {
-            if (v - self.last_result).abs() > 0.5 {
+            if v != self.last_result {
                 let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
                 log(&format!(
-                    "compare[{}]: {}={a:.4} {}={b:.4} -> {}={v:.0}",
+                    "compare[{}]: {}={a:.4} {}={b:.4} -> {}={v}",
                     mat_name, self.src_a, self.src_b, self.result
                 ));
                 self.last_result = v;
@@ -320,13 +320,13 @@ impl Proxy for CompareProxy {
     }
 }
 
-/// l4nrp_is_in_range —— 读输入变量（变量名可配置），在 [min,max] 内则输出 1.0 否则 0.0。
+/// l4nrp_is_in_range —— 读输入变量（变量名可配置），在 [min,max] 内则输出 1 否则 0。
 struct IsInRangeProxy {
     src: String,
     min: String,
     max: String,
     result: String,
-    last_result: f32,
+    last_result: i32,
     // 缓存变量名，避免每帧堆分配（apply_kv 更新时重建）
     src_n: CString,
     min_n: CString,
@@ -340,7 +340,7 @@ impl Default for IsInRangeProxy {
             min: "$min_var".into(),
             max: "$max_var".into(),
             result: "$result_var".into(),
-            last_result: -1.0,
+            last_result: -1,
             src_n: cstr_of("$src_var"),
             min_n: cstr_of("$min_var"),
             max_n: cstr_of("$max_var"),
@@ -374,14 +374,14 @@ impl Proxy for IsInRangeProxy {
             // 材质失效/变量缺失 → 从活动表移除
             return false;
         }
-        let v = if src >= min && src <= max { 1.0 } else { 0.0 };
-        material::set_float(out, v);
+        let v = if src >= min && src <= max { 1 } else { 0 };
+        material::set_int(out, v);
         #[cfg(debug_assertions)]
         {
-            if (v - self.last_result).abs() > 0.5 {
+            if v != self.last_result {
                 let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
                 log(&format!(
-                    "is_in_range[{}]: {}={src:.4} in [{}={min:.4},{}={max:.4}] -> {}={v:.0}",
+                    "is_in_range[{}]: {}={src:.4} in [{}={min:.4},{}={max:.4}] -> {}={v}",
                     mat_name, self.src, self.min, self.max, self.result
                 ));
                 self.last_result = v;
