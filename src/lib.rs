@@ -427,9 +427,9 @@ impl Default for PrintVariable {
         Self {
             var: "$var".into(),
             var_type: VarType::Float,
-            last_float: f32::NAN,
+            last_float: f32::NEG_INFINITY,
             last_int: i32::MIN,
-            last_vec3: [f32::NAN; 3],
+            last_vec3: [f32::NEG_INFINITY; 3],
             last_str: String::new(),
             var_n: cstr_of("$var"),
         }
@@ -460,7 +460,7 @@ impl Proxy for PrintVariable {
         match self.var_type {
             // ---- 向量：get_vec 读三分量 ----
             VarType::Vector => {
-                let mut o = [f32::NAN; 3];
+                let mut o = [f32::NEG_INFINITY; 3];
                 material::get_vec(var, &mut o);
                 if (o[0] - self.last_vec3[0]).abs() > EPS ||
                     (o[1] - self.last_vec3[1]).abs() > EPS ||
@@ -668,7 +668,7 @@ impl Default for Vec3Proxy {
             src_y: "$src_y".into(),
             src_z: "$src_z".into(),
             result: "$result_var".into(),
-            last_result: [f32::NAN; 3],
+            last_result: [f32::NEG_INFINITY; 3],
             src_x_n: cstr_of(""),
             src_y_n: cstr_of(""),
             src_z_n: cstr_of(""),
