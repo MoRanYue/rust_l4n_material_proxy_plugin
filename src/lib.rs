@@ -7,6 +7,7 @@
 
 mod engine;
 mod kv;
+mod expr;
 mod material;
 mod util;
 
@@ -479,6 +480,226 @@ impl Proxy for PrintVariable {
     }
 }
 
+/// l4nrp_str_concat —— 拼接 2 个字符串变量（`src_a` + `src_b` → `result`）。
+struct StrConcatProxy {
+    src_a: String,
+    src_b: String,
+    result: String,
+    last_result: CString,
+    src_a_n: CString,
+    src_b_n: CString,
+    result_n: CString,
+}
+impl Default for StrConcatProxy {
+    fn default() -> Self {
+        Self {
+            src_a: "$src_var_1".into(),
+            src_b: "$src_var_2".into(),
+            result: "$result_var".into(),
+            last_result: cstr_of(""),
+            src_a_n: cstr_of("$src_var_1"),
+            src_b_n: cstr_of("$src_var_2"),
+            result_n: cstr_of("$result_var"),
+        }
+    }
+}
+impl Proxy for StrConcatProxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "src_a" | "src1" | "input_a" | "input1" => set_kv(&mut self.src_a, &mut self.src_a_n, value),
+            "src_b" | "src2" | "input_b" | "input2" => set_kv(&mut self.src_b, &mut self.src_b_n, value),
+            "result" | "result_var" | "output" => set_kv(&mut self.result, &mut self.result_n, value),
+            _ => {}
+        }
+    }
+    // 依赖每帧变化的输入，需要每帧重算
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+        if material.is_null() {
+            return false;
+        }
+        let a = material::get_string(material::find_var(material, &self.src_a_n)).unwrap_or_default();
+        let b = material::get_string(material::find_var(material, &self.src_b_n)).unwrap_or_default();
+        let out = material::find_var(material, &self.result_n);
+        if out.is_null() {
+            // 材质失效/变量缺失 → 从活动表移除
+            return false;
+        }
+        let v = format!("{a}{b}");
+        let c = cstr_of(&v);
+        material::set_string(out, &c);
+        #[cfg(debug_assertions)]
+        {
+            if self.last_result.to_bytes() != v.as_bytes() {
+                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                log(&format!(
+                    "str_concat[{}]: {}='{a}' {}='{b}' -> {}='{v}'",
+                    mat_name, self.src_a, self.src_b, self.result
+                ));
+                self.last_result = cstr_of(&v);
+            }
+        }
+        true
+    }
+}
+
+/// l4nrp_str_replace —— 把 `src` 字符串里所有 `search` 替换为 `replace` 并写入 `result`。
+///
+/// `search` / `replace` 若以 `$` 开头则当作变量名读取（`get_string`），否则当作字面字符串。
+struct StrReplaceProxy {
+    src: String,
+    search: String,
+    replace: String,
+    result: String,
+    last_result: CString,
+    src_n: CString,
+    search_n: CString,
+    replace_n: CString,
+    result_n: CString,
+}
+impl Default for StrReplaceProxy {
+    fn default() -> Self {
+        Self {
+            src: "$src_var".into(),
+            search: String::new(),
+            replace: String::new(),
+            result: "$result_var".into(),
+            last_result: cstr_of(""),
+            src_n: cstr_of("$src_var"),
+            search_n: cstr_of(""),
+            replace_n: cstr_of(""),
+            result_n: cstr_of("$result_var"),
+        }
+    }
+}
+impl StrReplaceProxy {
+    /// 参数值以 `$` 开头时当作变量名读取，否则当作字面字符串。
+    unsafe fn read_str_or_var(&self, material: *mut c_void, val: &str, c: &CString) -> String {
+        if val.starts_with('$') {
+            material::get_string(material::find_var(material, c)).unwrap_or_default()
+        } else {
+            val.to_string()
+        }
+    }
+}
+impl Proxy for StrReplaceProxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "src" | "src_var" | "input" | "source" => set_kv(&mut self.src, &mut self.src_n, value),
+            "search" | "find" | "from" | "needle" => set_kv(&mut self.search, &mut self.search_n, value),
+            "replace" | "to" | "replacement" | "repl" => set_kv(&mut self.replace, &mut self.replace_n, value),
+            "result" | "result_var" | "output" => set_kv(&mut self.result, &mut self.result_n, value),
+            _ => {}
+        }
+    }
+    // 依赖每帧变化的输入，需要每帧重算
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+        if material.is_null() {
+            return false;
+        }
+        let src = material::get_string(material::find_var(material, &self.src_n)).unwrap_or_default();
+        let search = self.read_str_or_var(material, &self.search, &self.search_n);
+        let replace = self.read_str_or_var(material, &self.replace, &self.replace_n);
+        let out = material::find_var(material, &self.result_n);
+        if out.is_null() {
+            // 材质失效/变量缺失 → 从活动表移除
+            return false;
+        }
+        let v = src.replace(&search, &replace);
+        let c = cstr_of(&v);
+        material::set_string(out, &c);
+        #[cfg(debug_assertions)]
+        {
+            if self.last_result.to_bytes() != v.as_bytes() {
+                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                log(&format!(
+                    "str_replace[{}]: {}='{src}' '{}'->'{}' -> {}='{v}'",
+                    mat_name, self.src, self.search, self.replace, self.result
+                ));
+                self.last_result = cstr_of(&v);
+            }
+        }
+        true
+    }
+}
+
+/// l4nrp_math —— 计算数学表达式，支持读取材质已定义的 VMT 变量（`$var` 或 `var`）。
+///
+/// 表达式由 [`expr`](expr.rs) 求值器解析：运算符 `+ - * / % ^`、括号、一元负号，以及常用函数
+/// （`sin/cos/tan/asin/acos/atan/atan2/sqrt/cbrt/abs/floor/ceil/round/sign/min/max/clamp/pow/
+/// exp/ln/log/log10/fmod/lerp/pi`）。表达式里的 `$name` 或 `name` 会经 `get_float` 读取该材质
+/// 已声明的 VMT 变量（未定义变量按 0.0 处理）。结果写入 `result` 变量（每帧）。
+struct MathProxy {
+    expr: String,
+    result: String,
+    last_result: f32,
+    result_n: CString,
+}
+impl Default for MathProxy {
+    fn default() -> Self {
+        Self {
+            expr: "0".into(),
+            result: "$result_var".into(),
+            last_result: f32::NEG_INFINITY,
+            result_n: cstr_of("$result_var"),
+        }
+    }
+}
+impl Proxy for MathProxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "expr" | "expression" | "formula" | "calc" | "math" => self.expr = value.to_string(),
+            "result" | "result_var" | "output" => set_kv(&mut self.result, &mut self.result_n, value),
+            _ => {}
+        }
+    }
+    // 依赖每帧变化的输入，需要每帧重算
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+        if material.is_null() {
+            return false;
+        }
+        let out = material::find_var(material, &self.result_n);
+        if out.is_null() {
+            // 材质失效/变量缺失 → 从活动表移除
+            return false;
+        }
+        // 变量解析：表达式里的 `name` → 读材质 `$name` 变量
+        let mut resolve = |name: &str| -> f32 {
+            let full = format!("${name}");
+            let c = cstr_of(&full);
+            unsafe { material::get_float(material::find_var(material, &c)) }
+        };
+        match expr::eval(&self.expr, &mut resolve) {
+            Ok(v) => {
+                material::set_float(out, v);
+                #[cfg(debug_assertions)]
+                {
+                    if (v - self.last_result).abs() > 1e-6 {
+                        let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                        log(&format!(
+                            "math[{}]: {}='{}' = {}",
+                            mat_name, self.result, self.expr, v
+                        ));
+                        self.last_result = v;
+                    }
+                }
+            }
+            Err(e) => {
+                log(&format!("math: expr '{}' error: {}", self.expr, e.0));
+            }
+        }
+        true
+    }
+}
+
 // ---------------------------------------------------------------------------
 // IL4NPlugin 实现
 // ---------------------------------------------------------------------------
@@ -533,6 +754,9 @@ unsafe fn try_bind_and_install() {
     material::register_proxy::<CompareProxy>("l4nrp_compare");
     material::register_proxy::<IsInRangeProxy>("l4nrp_is_in_range");
     material::register_proxy::<PrintVariable>("l4nrp_print_variable");
+    material::register_proxy::<StrConcatProxy>("l4nrp_str_concat");
+    material::register_proxy::<StrReplaceProxy>("l4nrp_str_replace");
+    material::register_proxy::<MathProxy>("l4nrp_math");
     log(&format!(
         "registered proxies: {:?}",
         material::registered_names()

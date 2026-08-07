@@ -23,6 +23,7 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 | [`src/kv.rs`](src/kv.rs) | `Proxy` trait 定义 + 内存可读性检查（`is_readable`） |
 | [`src/material.rs`](src/material.rs) | 代理注册表、KeyValues 解析、detour hook、D3D EndScene 每帧执行 |
 | [`src/util.rs`](src/util.rs) | 通用小工具：`RelativeCompare`（f32 相对比较，容差 1e-6），供比较类代理复用 |
+| [`src/expr.rs`](src/expr.rs) | 数学表达式求值器（无依赖），供 `l4nrp_math` 使用 |
 
 ## 逆向背景（为什么不能"正常"创建代理对象）
 
@@ -162,6 +163,9 @@ material::register_proxy::<DoesEqualProxy>("l4nrp_does_equal");
 material::register_proxy::<CompareProxy>("l4nrp_compare");
 material::register_proxy::<IsInRangeProxy>("l4nrp_is_in_range");
 material::register_proxy::<PrintVariable>("l4nrp_print_variable");
+material::register_proxy::<StrConcatProxy>("l4nrp_str_concat");
+material::register_proxy::<StrReplaceProxy>("l4nrp_str_replace");
+material::register_proxy::<MathProxy>("l4nrp_math");
 ```
 
 > 注意：`l4nrp_color_ramp` / `l4nrp_log_pulse` / `l4nrp_force_red` 三个演示代理目前仅在
@@ -171,13 +175,24 @@ material::register_proxy::<PrintVariable>("l4nrp_print_variable");
 > **整数结果用 `SetInt`**：比较类代理（`does_equal` / `compare` / `is_in_range`）输出 0/1（`compare`
 > 为 -1/0/1）的结果变量用 `material::set_int` 写入（输入比较仍用 `get_float`）；`PrintVariable`
 > 用 `get_int` / `get_string` 读取 int / string 类型变量。
+>
+> **字符串读写用 `SetString`/`GetString`**：`str_concat`（`src_a`+`src_b`→`result`）与
+> `str_replace`（`src` 里把 `search` 全替换为 `replace` →`result`）用 `material::get_string` 读、
+> `material::set_string` 写（均 `per_frame`，每次先复制指针再释放锁，见上）。`str_replace` 的
+> `search`/`replace` 若以 `$` 开头当作变量名读取，否则当作字面字符串。
+>
+> **`l4nrp_math` 数学表达式**：表达式由 [`src/expr.rs`](src/expr.rs) 求值（无第三方依赖），支持
+> `+ - * / % ^`、括号、一元负号与常用函数（`sin/cos/sqrt/abs/min/max/clamp/pow/lerp/...`）；
+> 表达式里的 `$name` 或 `name` 经 `get_float` 读取该材质已声明变量（未定义按 0.0），结果写
+> `result`（每帧）。
 
 - **CString 缓存**：`per_frame` 代理在 struct 里缓存变量名 `CString`（`cstr_of` 构造），避免每帧
   反复堆分配；`apply_kv` 更新变量名时用辅助函数 `set_kv(&mut dst, &mut c, value)` 同步重建缓存
   （位于 [`src/lib.rs`](src/lib.rs)，可复用）。
 - 演示代理见 [`src/lib.rs`](src/lib.rs)：`ColorRampProxy` / `LogPulseProxy` / `ForceRedProxy` /
-  `DoesEqualProxy` / `CompareProxy` / `IsInRangeProxy` / `PrintVariable`。
-- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 7 个代理及其参数）。
+  `DoesEqualProxy` / `CompareProxy` / `IsInRangeProxy` / `PrintVariable` / `StrConcatProxy` /
+  `StrReplaceProxy` / `MathProxy`。
+- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 10 个代理及其参数）。
 
 ## 构建 / 部署 / 验证
 

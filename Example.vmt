@@ -31,11 +31,18 @@
     "$min_var"   "0.0"
     "$max_var"   "1.0"
     "$result_var2" "0"
+    "$math_result" "0" // l4nrp_math 输出
 
     // l4nrp_print_variable 的输入变量（标量 / 向量 / 字符串各一个）
     "$var"    "0.5"
     "$varvec" "[0.1 0.2 0.3]"
     "$varname" "Example texture"
+
+    // l4nrp_str_concat / l4nrp_str_replace 的输入 / 输出变量（字符串）
+    "$str_a"     "hello world"
+    "$str_b"     " example"
+    "$str_result"  "concat result"
+    "$str_result2" "replace result"
 
     "Proxies"
     {
@@ -91,7 +98,25 @@
             "result" "$result_var2"
         }
 
-        // 7) l4nrp_print_variable —— 每帧读取变量并打印到日志
+        // 7) l4nrp_str_concat —— 每帧拼接 $str_a + $str_b → $str_result
+        "l4nrp_str_concat"
+        {
+            "src_a"  "$str_a"
+            "src_b"  "$str_b"
+            "result" "$str_result"
+        }
+
+        // 8) l4nrp_str_replace —— 每帧把 $str_a 中所有 "lo" 替换为 "xx" → $str_result2
+        //    search / replace 以 "$" 开头则当作变量名读取，否则为字面字符串
+        "l4nrp_str_replace"
+        {
+            "src"     "$str_a"
+            "search"  "lo"
+            "replace" "xx"
+            "result"  "$str_result2"
+        }
+
+        // 9) l4nrp_print_variable —— 每帧读取变量并打印到日志
         //    type 可配置：float（默认）/ int / vector / string（各类型分开处理）
         "l4nrp_print_variable"
         {
@@ -107,6 +132,14 @@
         {
             "var"  "$varname" // 字符串示例（IMaterialVar::GetStringValue = vtable +0x18）
             "type" "string"   // 打印 ... ='Example texture' (str)
+        }
+
+        // 10) l4nrp_math —— 每帧计算数学表达式，$var 读材质已定义变量，结果写入 $math_result
+        //     支持 + - * / % ^、括号、一元负号与函数（sin/cos/sqrt/min/max/clamp/... 见 AGENTS.md）
+        "l4nrp_math"
+        {
+            "expr"   "($src_var_1 + $src_var_2) * $min_var"
+            "result" "$math_result"
         }
     }
 }
