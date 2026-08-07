@@ -94,7 +94,17 @@ materialsystem.dll `FUN_10002d50`（RVA `0x2d50`）是引擎解析 VMT `"Proxies
 - `IMaterialVar`：
   - `SetFloatValue` `+0x0c`、`SetIntValue` `+0x10`、`SetStringValue` `+0x14`
   - `SetVecValue(float*, n)` `+0x30`、`SetVecComponentValue` `+0x64`
-  - `GetFloatValue` `+0x6c`、`GetVecValue` `+0x70`
+  - `GetStringValue` `+0x18`、`GetIntValue` `+0x68`、`GetFloatValue` `+0x6c`、`GetVecValue` `+0x70`
+  - `GetVecValueInternal` `+0x74`（返回内部 `float*`，即 `this+3`）、`VectorSize` `+0x78`（返回分量数）
+  - **没有 `GetVecComponentValue`（读单分量）槽位** —— 只有写单分量的 `SetVecComponentValue(+0x64)`；
+    读单分量用 `get_vec` 取下标，或 `GetVecValueInternal` 返回指针后读 `[n]`（插件提供
+    `material::get_vec_component(var, index)` 封装前者）。
+
+> **`GetStringValue` = `+0x18` 的逆向依据**（`ghidra_matvar_getstring*.txt`）：引用诊断字符串
+> `"CMaterialVar::GetStringValue: Unknown material var type"` 的实现 `FUN_10019e70`（case 1:
+> `return param_1[1]` 直接返回内部字符串指针）位于 vtable@0x1009d274 的 **+0x18** 槽位；该 vtable
+> 起点由已验证偏移交叉确认（+0x0c=SetFloat、+0x14=SetString、+0x6c=GetFloat、+0x70=GetVec）。
+> 顺带确认 `GetIntValue` = `+0x68`（`FUN_10019c60: return param_1[2]`）。
 
 > `FindVar` 只对**已在 VMT 声明**的变量有效（引擎只为声明过的变量创建 `IMaterialVar`）。
 

@@ -16,6 +16,8 @@ const MATVAR_SET_INT: usize = 0x10;
 const MATVAR_SET_STRING: usize = 0x14;
 const MATVAR_SET_VEC: usize = 0x30;
 const MATVAR_SET_VEC_COMPONENT: usize = 0x64;
+const MATVAR_GET_STRING: usize = 0x18;
+const MATVAR_GET_INT: usize = 0x68;
 const MATVAR_GET_FLOAT: usize = 0x6c;
 const MATVAR_GET_VEC: usize = 0x70;
 
@@ -25,6 +27,8 @@ type SetFloatFn = unsafe extern "thiscall" fn(*const c_void, f32);
 type SetIntFn = unsafe extern "thiscall" fn(*const c_void, i32);
 type SetStringFn = unsafe extern "thiscall" fn(*const c_void, *const c_char);
 type SetVecFn = unsafe extern "thiscall" fn(*const c_void, *const f32, i32);
+type GetStringFn = unsafe extern "thiscall" fn(*const c_void) -> *const c_char;
+type GetIntFn = unsafe extern "thiscall" fn(*const c_void) -> i32;
 type GetFloatFn = unsafe extern "thiscall" fn(*const c_void) -> f32;
 type GetVecFn = unsafe extern "thiscall" fn(*const c_void, *mut f32, i32);
 
@@ -152,6 +156,51 @@ pub unsafe fn get_float(var: *mut c_void) -> f32 {
     f(var)
 }
 
+/// 读取 IMaterialVar 的字符串值（等价 `GetStringValue()`，vtable +0x18，thiscall 返回 `const char*`）。
+///
+/// 逆向依据（materialsystem.dll）：引用诊断字符串 `"CMaterialVar::GetStringValue: Unknown
+/// material var type"` 的实现 `FUN_10019e70`（case 1: `return param_1[1]` 直接返回内部字符串
+/// 指针）位于 vtable@0x1009d274 的 **+0x18** 槽位；该 vtable 起点由已验证偏移交叉确认
+/// （+0x0c=SetFloat、+0x14=SetString、+0x6c=GetFloat、+0x70=GetVec）。顺带确认
+/// `GetIntValue` = +0x68（`FUN_10019c60: return param_1[2]`）。
+///
+/// 返回字符串副本；坏指针/不可读内存返回 `None`（防 strlen 崩溃）。
+/// # Safety
+/// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
+pub unsafe fn get_string(var: *mut c_void) -> Option<String> {
+    if var.is_null() {
+        return None;
+    }
+    let vft = *(var as *const *const c_void);
+    if vft.is_null() {
+        return None;
+    }
+    let f: GetStringFn = transmute(*((vft as *const usize).add(MATVAR_GET_STRING / 4)));
+    let p = f(var);
+    if p.is_null() {
+        return None;
+    }
+    if !crate::kv::is_readable(p as *const c_void) {
+        return None;
+    }
+    Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+}
+
+/// 读取 IMaterialVar 的整数值（等价 `GetIntValue()`，vtable +0x68，thiscall 返回 `int`）。
+/// # Safety
+/// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
+pub unsafe fn get_int(var: *mut c_void) -> i32 {
+    if var.is_null() {
+        return 0;
+    }
+    let vft = *(var as *const *const c_void);
+    if vft.is_null() {
+        return 0;
+    }
+    let f: GetIntFn = transmute(*((vft as *const usize).add(MATVAR_GET_INT / 4)));
+    f(var)
+}
+
 /// 读取 IMaterialVar 的向量值（等价 `GetVecValue(float*, n)`，vtable +0x70）。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
@@ -165,6 +214,23 @@ pub unsafe fn get_vec(var: *mut c_void, out: &mut [f32; 3]) {
     }
     let f: GetVecFn = transmute(*((vft as *const usize).add(MATVAR_GET_VEC / 4)));
     f(var, out.as_mut_ptr(), 3);
+}
+
+/// 读取 IMaterialVar 向量的第 `index` 个分量（float）。
+///
+/// 注意：L4D2 `IMaterialVar` **没有** `GetVecComponentValue`（读单分量）槽位，只有写单分量的
+/// `SetVecComponentValue(+0x64)`；读单分量需经 `GetVecValue(+0x70)` 读全向量后取下标
+/// （或 `GetVecValueInternal(+0x74)` 返回内部 `float*` 后读 `[n]`）。此函数封装前者。
+/// # Safety
+/// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
+pub unsafe fn get_vec_component(var: *mut c_void, index: usize) -> f32 {
+    let mut o = [0.0f32; 3];
+    get_vec(var, &mut o);
+    if index < 3 {
+        o[index]
+    } else {
+        0.0
+    }
 }
 
 // ---------- 代理注册表（泛型） ----------

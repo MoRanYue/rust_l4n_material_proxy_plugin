@@ -32,9 +32,10 @@
     "$max_var"   "1.0"
     "$result_var2" "0"
 
-    // l4nrp_print_variable 的输入变量（标量 / 向量各一个）
+    // l4nrp_print_variable 的输入变量（标量 / 向量 / 字符串各一个）
     "$var"    "0.5"
     "$varvec" "[0.1 0.2 0.3]"
+    "$varname" "Example texture"
 
     "Proxies"
     {
@@ -91,7 +92,7 @@
         }
 
         // 7) l4nrp_print_variable —— 每帧读取变量并打印到日志
-        //    type 可配置：float（默认）/ int / vector（数值与向量分开处理）
+        //    type 可配置：float（默认）/ int / vector / string（各类型分开处理）
         "l4nrp_print_variable"
         {
             "var"  "$var"     // 要读取的变量名
@@ -101,6 +102,11 @@
         {
             "var"  "$varvec"  // 向量示例
             "type" "vector"   // 打印 ... =0.1000,0.2000,0.3000 (vec)
+        }
+        "l4nrp_print_variable"
+        {
+            "var"  "$varname" // 字符串示例（IMaterialVar::GetStringValue = vtable +0x18）
+            "type" "string"   // 打印 ... ='Example texture' (str)
         }
     }
 }

@@ -61,7 +61,7 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 | `l4nrp_does_equal` | `src_a`→`$src_var_1`、`src_b`→`$src_var_2`、`result`→`$result_var` | 相等则写 result=1 否则 0（每帧） |
 | `l4nrp_compare` | `src_a`→`$src_var_1`、`src_b`→`$src_var_2`、`result`→`$result_var` | 三态比较：a==b→0、a>b→1、a<b→-1（相对容差 1e-6，每帧） |
 | `l4nrp_is_in_range` | `src`→`$src_var`、`min`→`$min_var`、`max`→`$max_var`、`result`→`$result_var` | 在 [min,max] 内写 result=1 否则 0（每帧） |
-| `l4nrp_print_variable` | `var`→`$var`、`type`→`float`（`float`/`int`/`vector`） | 每帧读取变量并打印 |
+| `l4nrp_print_variable` | `var`→`$var`、`type`→`float`（`float`/`int`/`vector`/`string`） | 每帧读取变量并打印 |
 
 ### 注意事项
 

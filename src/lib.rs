@@ -391,22 +391,23 @@ impl Proxy for IsInRangeProxy {
     }
 }
 
-/// l4nrp_print_variable —— 每帧读取并打印变量值（`type` 可配置：float / int / vector）。
+/// l4nrp_print_variable —— 每帧读取并打印变量值（`type` 可配置：float / int / vector / string）。
 ///
-/// 数值（float/int）与向量（vector）分开处理：读取函数与日志格式各自独立。
+/// 数值（float/int）、向量（vector）、字符串（string）分开处理：读取函数与日志格式各自独立。
 #[derive(Clone, Copy, PartialEq)]
 enum VarType {
     Float,
     Int,
     Vector,
+    String,
 }
 impl VarType {
-    /// 解析 VMT 参数值（"float"/"int"/"vector" 等），未知值回退到 Float。
     fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "int" | "integer" => VarType::Int,
             "vector" | "vec3" | "vec" => VarType::Vector,
-            _ => VarType::Float,
+            "string" | "str" | "text" => VarType::String,
+            _ => VarType::String,
         }
     }
 }
@@ -458,13 +459,15 @@ impl Proxy for PrintVariable {
                     mat_name, self.var, o[0], o[1], o[2]
                 ));
             }
-            // ---- 整数：get_float 后取整显示 ----
+            // ---- 整数：get_int 直接读整数值（vtable +0x68）----
             VarType::Int => {
-                let v = material::get_float(var);
-                log(&format!(
-                    "print_variable[{}]: {}={} (int)",
-                    mat_name, self.var, v as i32
-                ));
+                let v = material::get_int(var);
+                log(&format!("print_variable[{}]: {}={v} (int)", mat_name, self.var));
+            }
+            // ---- 字符串：get_string 读字符串（vtable +0x18）----
+            VarType::String => {
+                let s = material::get_string(var).unwrap_or_else(|| "<null>".into());
+                log(&format!("print_variable[{}]: {}='{s}' (str)", mat_name, self.var));
             }
             // ---- 标量浮点 ----
             VarType::Float => {
