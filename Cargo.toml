@@ -9,7 +9,7 @@ name = "rust_l4n_material_proxy_plugin"
 crate-type = ["cdylib"]
 
 [profile.release]
-opt-level = 2
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
