@@ -23,7 +23,7 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 | [`src/kv.rs`](src/kv.rs) | `Proxy` trait 定义 + 内存可读性检查（`is_readable`） |
 | [`src/material.rs`](src/material.rs) | 代理注册表、KeyValues 解析、detour hook、D3D EndScene 每帧执行 |
 | [`src/util.rs`](src/util.rs) | 通用小工具：`RelativeCompare`（f32 相对比较，容差 1e-6），供比较类代理复用 |
-| [`src/expr.rs`](src/expr.rs) | 数学表达式求值器（无依赖），供 `l4nrp_math` 使用 |
+| [`src/expr.rs`](src/expr.rs) | 表达式求值器（无依赖）：数学 + 比较（`== != < <= > >=`）+ 逻辑（`&& \|\| !`），供 `l4nrp_math` / `l4nrp_logic` 使用 |
 
 ## 逆向背景（为什么不能"正常"创建代理对象）
 
@@ -166,6 +166,10 @@ material::register_proxy::<PrintVariable>("l4nrp_print_variable");
 material::register_proxy::<StrConcatProxy>("l4nrp_str_concat");
 material::register_proxy::<StrReplaceProxy>("l4nrp_str_replace");
 material::register_proxy::<MathProxy>("l4nrp_math");
+material::register_proxy::<LogicProxy>("l4nrp_logic");
+material::register_proxy::<Vec3Proxy>("l4nrp_vec3");
+material::register_proxy::<DelaySetProxy>("l4nrp_delay_set");
+material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
 ```
 
 > 注意：`l4nrp_color_ramp` / `l4nrp_log_pulse` / `l4nrp_force_red` 三个演示代理目前仅在
@@ -181,23 +185,40 @@ material::register_proxy::<MathProxy>("l4nrp_math");
 > `material::set_string` 写（均 `per_frame`，每次先复制指针再释放锁，见上）。`str_replace` 的
 > `search`/`replace` 若以 `$` 开头当作变量名读取，否则当作字面字符串。
 >
-> **`l4nrp_math` 数学表达式**：表达式由 [`src/expr.rs`](src/expr.rs) 求值（无第三方依赖），支持
-> `+ - * / % ^`、括号、一元负号与常用函数（`sin/cos/sqrt/abs/min/max/clamp/pow/lerp/...`）；
-> 表达式里的 `$name` 或 `name` 经 `get_float` 读取该材质已声明变量（未定义按 0.0），结果写
-> `result`（每帧）。
+> **`l4nrp_math` 数学表达式**：表达式由 [`src/expr.rs`](src/expr.rs) `eval_math` 求值
+> （无第三方依赖），**仅支持数学**：`+ - * / % ^`、括号、一元负号与常用函数
+> （`sin/cos/sqrt/abs/min/max/clamp/pow/lerp/...`），**不支持**比较/逻辑运算符；表达式里的
+> `$name` 或 `name` 经 `get_float` 读取该材质已声明变量（未定义按 0.0），结果写 `result`（每帧）。
+>
+> **`l4nrp_logic` 逻辑表达式**：由 [`src/expr.rs`](src/expr.rs) `eval_logic` 求值，在数学运算之上
+> 增加比较（`==` `!=` `<` `<=` `>` `>=`）与逻辑（`&&` `||` `!`，非 0 视为真），另有范围函数
+> `in_range(v,min,max)`（含端点）/ `in_range_exclusively(v,min,max)`（不含端点）；表达式里的
+> `$name` 或 `name` 经 `get_float` 读取变量（未定义按 0.0），**结果写 `result`（整型 0/1，用
+> `set_int`）**，每帧重算。
+>
+> **`l4nrp_delay_set` 延迟置位**：检测 `trigger`（整型，`get_int`）非 0 的**上升沿**后，向全局
+> 计时器注册表（[`material.rs`](src/material.rs) `start_timer`）申请一个 **UUID v4 字符串手柄**
+> （`uuid` crate `Uuid::new_v4()`）并计时 `delay` 毫秒，到期由 `run_timers` 每帧把 `value` 变量的
+> 整型值（`get_int`）复制到 `output`（`set_int`）；可选 `handle` 变量写出当前手柄（字符串类型，
+> 无计时器写空字符串），供 `l4nrp_delay_abort` 等代理中断。上升沿触发（需先回 0 再置位才重复触发）。
+>
+> **`l4nrp_delay_abort` 中断计时器**：`trigger`（整型，`get_int`）非 0 时，读取 `handle` 变量
+> （字符串类型，`get_string`）指定的 UUID 手柄并调用 `material::abort_timer` 中断对应计时器
+> （幂等，无该计时器则无操作）。
 
 - **CString 缓存**：`per_frame` 代理在 struct 里缓存变量名 `CString`（`cstr_of` 构造），避免每帧
   反复堆分配；`apply_kv` 更新变量名时用辅助函数 `set_kv(&mut dst, &mut c, value)` 同步重建缓存
   （位于 [`src/lib.rs`](src/lib.rs)，可复用）。
 - 演示代理见 [`src/lib.rs`](src/lib.rs)：`ColorRampProxy` / `LogPulseProxy` / `ForceRedProxy` /
   `DoesEqualProxy` / `CompareProxy` / `IsInRangeProxy` / `PrintVariable` / `StrConcatProxy` /
-  `StrReplaceProxy` / `MathProxy`。
-- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 10 个代理及其参数）。
+  `StrReplaceProxy` / `MathProxy` / `LogicProxy` / `Vec3Proxy` / `DelaySetProxy` / `DelayAbortProxy`。
+- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 14 个代理及其参数）。
 
 ## 构建 / 部署 / 验证
 
 ```powershell
 cargo build --release   # 目标 i686-pc-windows-msvc
+cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/expr.rs)，宿主目标可跑）
 ```
 
 - 部署：复制 DLL 到游戏安装目录 `bin/neko/plugins`（必须与 `left4neko.dll` 同目录的 `neko/plugins`，

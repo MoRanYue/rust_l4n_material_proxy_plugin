@@ -1,24 +1,67 @@
-//! 数学表达式求值器（无第三方依赖）：支持四则运算、幂、括号、一元负号、常用函数，
-//! 以及材质 VMT 变量引用。
+//! 表达式求值器（无第三方依赖）：数学 + 比较 + 逻辑运算。
 //!
-//! - 运算符：`+` `-` `*` `/` `%`（取余）`^`（幂，右结合）
+//! - 数学运算符：`+` `-` `*` `/` `%`（取余）`^`（幂，右结合）
+//! - 比较运算符（仅逻辑模式）：`==` `!=` `<` `<=` `>` `>=`（结果为 1.0/0.0）
+//! - 逻辑运算符（仅逻辑模式）：`&&`（与）`||`（或）`!`（非），非 0 视为真
 //! - 函数：`sin cos tan asin acos atan atan2 sqrt cbrt abs floor ceil round sign
 //!   min max clamp pow exp ln/log log10 fmod lerp pi`
+//! - 范围函数：`in_range(v,min,max)`（含端点）、`in_range_exclusively(v,min,max)`（不含端点）
 //! - 变量：`$name` 或 `name`（不带 `$` 也行），经 `resolve` 回调返回数值；
 //!   材质代理里用它读取已声明的 VMT 变量（未定义变量解析为 0.0）。
+//!
+//! `l4nrp_math` 用 [`eval_math`]（仅数学，不含比较/逻辑）；`l4nrp_logic` 用 [`eval_logic`]
+//! （数学 + 比较 + 逻辑）。
 
 /// 表达式错误。
 pub struct ExprError(pub String);
 
-/// 求值 `input`；`resolve(name)` 把变量名（不含 `$`）解析为 `f32`。
+#[derive(Clone, Copy)]
+enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// 非 0 视为逻辑真。
+#[inline]
+fn truth(x: f32) -> bool {
+    x != 0.0
+}
+
+/// 求值（数学模式：仅四则/幂/括号/函数，**不支持**比较与逻辑运算符）。供 `l4nrp_math` 使用。
 ///
 /// 例：`"($v_1 * 2) + min($v_2, 3) ^ 2"`
-pub fn eval(input: &str, resolve: &mut dyn FnMut(&str) -> f32) -> Result<f32, ExprError> {
+pub fn eval_math(input: &str, resolve: &mut dyn FnMut(&str) -> f32) -> Result<f32, ExprError> {
+    eval_with(input, resolve, false)
+}
+
+/// 求值（逻辑模式：在数学基础上支持比较 `== != < <= > >=` 与逻辑 `&& || !`，
+/// 以及 `in_range` / `in_range_exclusively`）。供 `l4nrp_logic` 使用。
+///
+/// 例：`"$a >= 1 && $b < 3 || !$c"`
+/// 例：`"in_range($v, $min, $max) && !$off"`
+pub fn eval_logic(input: &str, resolve: &mut dyn FnMut(&str) -> f32) -> Result<f32, ExprError> {
+    eval_with(input, resolve, true)
+}
+
+fn eval_with(
+    input: &str,
+    resolve: &mut dyn FnMut(&str) -> f32,
+    logical: bool,
+) -> Result<f32, ExprError> {
     let mut p = Parser {
         chars: input.chars().peekable(),
         resolve,
+        logical,
     };
-    let v = p.parse_expr()?;
+    let v = if logical {
+        p.parse_logic_or()?
+    } else {
+        p.parse_expr()?
+    };
     if let Some(c) = p.peek() {
         return Err(ExprError(format!("unexpected '{c}'")));
     }
@@ -28,6 +71,7 @@ pub fn eval(input: &str, resolve: &mut dyn FnMut(&str) -> f32) -> Result<f32, Ex
 struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     resolve: &'a mut dyn FnMut(&str) -> f32,
+    logical: bool,
 }
 
 impl Parser<'_> {
@@ -42,6 +86,92 @@ impl Parser<'_> {
     fn skip_ws(&mut self) {
         while matches!(self.chars.peek(), Some(c) if c.is_whitespace()) {
             self.chars.next();
+        }
+    }
+    /// 尝试消费两字符运算符 `ab`（中间不允许空白）。成功则消费并返回 true。
+    fn two_char(&mut self, a: char, b: char) -> bool {
+        let mut it = self.chars.clone();
+        if it.next() == Some(a) && it.next() == Some(b) {
+            self.chars.next();
+            self.chars.next();
+            true
+        } else {
+            false
+        }
+    }
+
+    // logic_or := logic_and (('||') logic_and)*   （仅逻辑模式）
+    fn parse_logic_or(&mut self) -> Result<f32, ExprError> {
+        let mut v = self.parse_logic_and()?;
+        while self.logical {
+            self.skip_ws();
+            if self.two_char('|', '|') {
+                let r = self.parse_logic_and()?;
+                v = if truth(v) || truth(r) { 1.0 } else { 0.0 };
+            } else {
+                break;
+            }
+        }
+        Ok(v)
+    }
+
+    // logic_and := compare (('&&') compare)*   （仅逻辑模式）
+    fn parse_logic_and(&mut self) -> Result<f32, ExprError> {
+        let mut v = self.parse_compare()?;
+        while self.logical {
+            self.skip_ws();
+            if self.two_char('&', '&') {
+                let r = self.parse_compare()?;
+                v = if truth(v) && truth(r) { 1.0 } else { 0.0 };
+            } else {
+                break;
+            }
+        }
+        Ok(v)
+    }
+
+    // compare := expr (('=='|'!='|'<='|'>='|'<'|'>') expr)?   （仅逻辑模式）
+    fn parse_compare(&mut self) -> Result<f32, ExprError> {
+        let l = self.parse_expr()?;
+        if !self.logical {
+            return Ok(l);
+        }
+        self.skip_ws();
+        let op: Option<CmpOp> = if self.two_char('=', '=') {
+            Some(CmpOp::Eq)
+        } else if self.two_char('!', '=') {
+            Some(CmpOp::Ne)
+        } else if self.two_char('<', '=') {
+            Some(CmpOp::Le)
+        } else if self.two_char('>', '=') {
+            Some(CmpOp::Ge)
+        } else {
+            match self.peek() {
+                Some('<') => {
+                    self.chars.next();
+                    Some(CmpOp::Lt)
+                }
+                Some('>') => {
+                    self.chars.next();
+                    Some(CmpOp::Gt)
+                }
+                _ => None,
+            }
+        };
+        match op {
+            Some(op) => {
+                let r = self.parse_expr()?;
+                let b = match op {
+                    CmpOp::Eq => l == r,
+                    CmpOp::Ne => l != r,
+                    CmpOp::Lt => l < r,
+                    CmpOp::Le => l <= r,
+                    CmpOp::Gt => l > r,
+                    CmpOp::Ge => l >= r,
+                };
+                Ok(if b { 1.0 } else { 0.0 })
+            }
+            None => Ok(l),
         }
     }
 
@@ -107,7 +237,7 @@ impl Parser<'_> {
         }
     }
 
-    // unary := ('-'|'+')* primary
+    // unary := ('-'|'+'|'!')* primary   （'!' 仅逻辑模式）
     fn parse_unary(&mut self) -> Result<f32, ExprError> {
         match self.peek() {
             Some('-') => {
@@ -117,6 +247,11 @@ impl Parser<'_> {
             Some('+') => {
                 self.chars.next();
                 self.parse_unary()
+            }
+            Some('!') if self.logical => {
+                self.chars.next();
+                let v = self.parse_unary()?;
+                Ok(if truth(v) { 0.0 } else { 1.0 })
             }
             _ => self.parse_primary(),
         }
@@ -158,7 +293,12 @@ impl Parser<'_> {
             }
         } else if c == '(' {
             self.chars.next();
-            let v = self.parse_expr()?;
+            // 括号内与所在模式一致（逻辑模式支持逻辑/比较；数学模式退化为纯算术）
+            let v = if self.logical {
+                self.parse_logic_or()?
+            } else {
+                self.parse_expr()?
+            };
             if self.next() != Some(')') {
                 return Err(ExprError("expected ')'".into()));
             }
@@ -177,7 +317,11 @@ impl Parser<'_> {
         }
         let mut args = Vec::new();
         loop {
-            args.push(self.parse_expr()?);
+            args.push(if self.logical {
+                self.parse_logic_or()?
+            } else {
+                self.parse_expr()?
+            });
             match self.next() {
                 Some(',') => continue,
                 Some(')') => break,
@@ -244,6 +388,27 @@ impl Parser<'_> {
                 }
                 Ok(args[0] + (args[1] - args[0]) * args[2])
             }
+            // 范围检测（逻辑代理用）：in_range 含端点，in_range_exclusively 不含端点
+            "in_range" => {
+                if args.len() != 3 {
+                    return Err(err(3, args.len()));
+                }
+                Ok(if args[0] >= args[1] && args[0] <= args[2] {
+                    1.0
+                } else {
+                    0.0
+                })
+            }
+            "in_range_exclusively" => {
+                if args.len() != 3 {
+                    return Err(err(3, args.len()));
+                }
+                Ok(if args[0] > args[1] && args[0] < args[2] {
+                    1.0
+                } else {
+                    0.0
+                })
+            }
             "pi" => {
                 if !args.is_empty() {
                     return Err(err(0, args.len()));
@@ -252,5 +417,72 @@ impl Parser<'_> {
             }
             _ => Err(ExprError(format!("unknown function '{name}'"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{eval_math, eval_logic};
+
+    fn resolve(name: &str) -> f32 {
+        match name {
+            "a" => 5.0,
+            "b" => 3.0,
+            "c" => 1.0,
+            "v" => 2.0,
+            _ => 0.0,
+        }
+    }
+    fn math(input: &str) -> Result<f32, String> {
+        let mut rf = |n: &str| resolve(n);
+        eval_math(input, &mut rf).map_err(|e| e.0)
+    }
+    fn logic(input: &str) -> Result<f32, String> {
+        let mut rf = |n: &str| resolve(n);
+        eval_logic(input, &mut rf).map_err(|e| e.0)
+    }
+
+    #[test]
+    fn math_arithmetic() {
+        assert_eq!(math("1 + 2 * 3").unwrap(), 7.0);
+        assert_eq!(math("(1 + 2) * 3").unwrap(), 9.0);
+        assert_eq!(math("2 ^ 3 ^ 2").unwrap(), 512.0);
+        assert_eq!(math("min($a, $b) + max(1, 2)").unwrap(), 5.0);
+    }
+
+    #[test]
+    fn math_rejects_logic_operators() {
+        assert!(math("$a < $b").is_err());
+        assert!(math("1 && 0").is_err());
+        assert!(math("1 || 0").is_err());
+        assert!(math("!$a").is_err());
+        assert!(math("$a == 5").is_err());
+    }
+
+    #[test]
+    fn logic_compare() {
+        assert_eq!(logic("$a > $b").unwrap(), 1.0);
+        assert_eq!(logic("$a < $b").unwrap(), 0.0);
+        assert_eq!(logic("$a >= 5").unwrap(), 1.0);
+        assert_eq!(logic("$a == 5").unwrap(), 1.0);
+        assert_eq!(logic("$a != 5").unwrap(), 0.0);
+        assert_eq!(logic("($a >= 5) == ($b >= 3)").unwrap(), 1.0);
+    }
+
+    #[test]
+    fn logic_boolean() {
+        assert_eq!(logic("$a > $b && $c != 2").unwrap(), 1.0);
+        assert_eq!(logic("$a > $b || 0").unwrap(), 1.0);
+        assert_eq!(logic("!$c").unwrap(), 0.0); // c=1 → 非真 → 0
+        assert_eq!(logic("!$a").unwrap(), 0.0); // a=5 非 0 → 真 → 非 → 0
+    }
+
+    #[test]
+    fn logic_in_range() {
+        assert_eq!(logic("in_range($v, 0, 3)").unwrap(), 1.0);
+        assert_eq!(logic("in_range($v, 3, 4)").unwrap(), 0.0);
+        assert_eq!(logic("in_range_exclusively($v, 0, 2)").unwrap(), 0.0); // 2 不在 (0,2)
+        assert_eq!(logic("in_range_exclusively($v, 0, 3)").unwrap(), 1.0);
+        assert_eq!(logic("in_range($v, $min, 3) && !$off").unwrap(), 1.0); // 未定义按 0
     }
 }

@@ -32,6 +32,14 @@
     "$max_var"   "1.0"
     "$result_var2" "0"
     "$math_result" "0" // l4nrp_math 输出
+    "$logic_result" "0" // l4nrp_logic 输出（整型 0/1）
+
+    // l4nrp_delay_set / l4nrp_delay_abort 的触发 / 输出 / 手柄变量
+    "$trigger_var"   "0" // 触发输入（整型，非 0 上升沿触发计时器）
+    "$value_var"     "3" // 计时结束后要复制到 $delay_output 的值来源（变量）
+    "$delay_output"  "0" // 计时结束后把 $value_var 的值复制到此处
+    "$timer_handle"  "" // 计时器 UUID v4 字符串手柄（delay_set 写入，供 delay_abort 中断）
+    "$abort_trigger" "0" // delay_abort 触发输入（非 0 时中断 $timer_handle 指定的计时器）
 
     // l4nrp_print_variable 的输入变量（标量 / 向量 / 字符串各一个）
     "$var"    "0.5"
@@ -140,6 +148,33 @@
         {
             "expr"   "($src_var_1 + $src_var_2) * $min_var"
             "result" "$math_result"
+        }
+
+        // 11) l4nrp_logic —— 每帧求值逻辑表达式（比较 == != < <= > >= 与逻辑 && || !，
+        //     非 0 视为真；另有 in_range / in_range_exclusively 范围函数），
+        //     结果写 $logic_result（整型 0/1）；$var 读材质已定义变量
+        "l4nrp_logic"
+        {
+            "expr"   "in_range($src_var, $min_var, $max_var) && !$src_var_2"
+            "result" "$logic_result"
+        }
+
+        // 12) l4nrp_delay_set —— 检测 $trigger_var（整型）非 0 上升沿后延迟 500ms，
+        //     把 $value_var 的值复制到 $delay_output；$timer_handle 写出计时器 UUID v4 手柄
+        "l4nrp_delay_set"
+        {
+            "trigger" "$trigger_var"
+            "delay"   "500"
+            "output"  "$delay_output"
+            "value"   "$value_var"
+            "handle"  "$timer_handle"
+        }
+
+        // 13) l4nrp_delay_abort —— $abort_trigger 非 0 时中断 $timer_handle 指定的计时器
+        "l4nrp_delay_abort"
+        {
+            "trigger" "$abort_trigger"
+            "handle"  "$timer_handle"
         }
     }
 }

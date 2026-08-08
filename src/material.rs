@@ -4,8 +4,12 @@
 
 use core::ffi::{c_char, c_void, CStr};
 use core::mem::transmute;
+use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
+
+use uuid::Uuid;
 
 use crate::kv::{is_readable, Proxy};
 
@@ -287,6 +291,8 @@ pub fn register_active(material: *mut c_void, proxy: Box<dyn Proxy>) {
 /// D3D 每帧回调：对所有活动代理执行 `bind`（读当前材质变量 → 计算 → 写回）。
 /// 注意：须先复制指针并释放 `ACTIVE` 锁再逐个 `bind`，避免锁重入死锁（见 AGENTS.md）。
 pub fn run_active_proxies() {
+    // 先触发到期的计时器（l4nrp_delay_set 生成的）
+    run_timers();
     let items: Vec<(u64, *mut c_void, *mut Box<dyn Proxy>)> = {
         let mut a = ACTIVE.lock().unwrap();
         a.iter_mut().map(|e| (e.id, e.material, &mut e.proxy as *mut Box<dyn Proxy>)).collect()
@@ -302,6 +308,77 @@ pub fn run_active_proxies() {
     if !stale.is_empty() {
         let mut a = ACTIVE.lock().unwrap();
         a.retain(|e| !stale.contains(&e.id));
+    }
+}
+
+// ---------- 计时器注册表（l4nrp_delay_set 生成 / l4nrp_delay_abort 中断） ----------
+struct ActiveTimer {
+    handle: String, // UUID v4 字符串手柄
+    material: *mut c_void,
+    output_n: CString, // 到期后把 value 变量整型值写入此变量
+    value_n: CString,  // 值来源变量名
+    end: Instant,
+}
+// material 指针仅在渲染线程内使用，手动标记 Send 以放入 Mutex
+unsafe impl Send for ActiveTimer {}
+static TIMERS: Mutex<Vec<ActiveTimer>> = Mutex::new(Vec::new());
+
+/// 启动一个计时器：`delay_ms` 后（由 `run_timers` 每帧触发）把 `value` 变量整型值写入
+/// `output`。返回 **UUID v4 字符串手柄**，供中断/查询。
+pub fn start_timer(material: *mut c_void, output_n: CString, value_n: CString, delay_ms: u64) -> String {
+    let h = Uuid::new_v4().to_string();
+    let mut ts = TIMERS.lock().unwrap();
+    ts.push(ActiveTimer {
+        handle: h.clone(),
+        material,
+        output_n,
+        value_n,
+        end: Instant::now() + std::time::Duration::from_millis(delay_ms),
+    });
+    h
+}
+
+/// 按手柄（UUID 字符串）中断计时器。返回是否找到并移除。
+pub fn abort_timer(handle: &str) -> bool {
+    let mut ts = TIMERS.lock().unwrap();
+    let before = ts.len();
+    ts.retain(|t| t.handle != handle);
+    ts.len() != before
+}
+
+/// 指定手柄的计时器是否仍在运行。
+pub fn timer_active(handle: &str) -> bool {
+    TIMERS.lock().unwrap().iter().any(|t| t.handle == handle)
+}
+
+/// 每帧触发到期的计时器：把 `value` 变量整型值写入 `output` 并移除。
+/// 先取出到期项再释放锁执行，避免持锁调用引擎（见 AGENTS.md 锁注意事项）。
+fn run_timers() {
+    let mut fired: Vec<ActiveTimer> = Vec::new();
+    {
+        let now = Instant::now();
+        let mut ts = TIMERS.lock().unwrap();
+        let mut i = 0;
+        while i < ts.len() {
+            if now >= ts[i].end {
+                fired.push(ts.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for t in fired {
+        // 防悬垂：材质已不可读（被引擎卸载/替换）则丢弃该计时器，避免解引用坏指针崩溃
+        if !is_readable(t.material as *const c_void) {
+            continue;
+        }
+        unsafe {
+            let out = find_var(t.material, &t.output_n);
+            if !out.is_null() {
+                let val = get_int(find_var(t.material, &t.value_n));
+                set_int(out, val);
+            }
+        }
     }
 }
 

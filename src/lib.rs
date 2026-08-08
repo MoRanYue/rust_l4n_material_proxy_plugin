@@ -769,7 +769,7 @@ impl Proxy for MathProxy {
             let c = cstr_of(&full);
             unsafe { material::get_float(material::find_var(material, &c)) }
         };
-        match expr::eval(&self.expr, &mut resolve) {
+        match expr::eval_math(&self.expr, &mut resolve) {
             Ok(v) => {
                 material::set_float(out, v);
                 #[cfg(debug_assertions)]
@@ -786,6 +786,260 @@ impl Proxy for MathProxy {
             }
             Err(e) => {
                 log(&format!("math: expr '{}' error: {}", self.expr, e.0));
+            }
+        }
+        true
+    }
+}
+
+/// l4nrp_logic —— 每帧求值逻辑/布尔表达式（比较 `== != < <= > >=` 与逻辑 `&& || !`，
+/// 非 0 视为真，另有 `in_range` / `in_range_exclusively` 范围函数；见 [`expr.rs`](src/expr.rs)
+/// `eval_logic`），结果写 `result`（整型 0/1，set_int）。
+/// 表达式里的 `$name` 或 `name` 经 `get_float` 读取该材质已声明变量（未定义按 0.0）。
+struct LogicProxy {
+    expr: String,
+    result: String,
+    last_result: i32,
+    result_n: CString,
+}
+impl Default for LogicProxy {
+    fn default() -> Self {
+        Self {
+            expr: "0".into(),
+            result: "$result_var".into(),
+            last_result: -1,
+            result_n: cstr_of("$result_var"),
+        }
+    }
+}
+impl Proxy for LogicProxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "expr" | "expression" | "condition" | "logic" | "bool" | "test" => {
+                self.expr = value.to_string()
+            }
+            "result" | "result_var" | "output" => set_kv(&mut self.result, &mut self.result_n, value),
+            _ => {}
+        }
+    }
+    // 依赖每帧变化的输入，需要每帧重算
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+        if material.is_null() {
+            return false;
+        }
+        let out = material::find_var(material, &self.result_n);
+        if out.is_null() {
+            // 材质失效/变量缺失 → 从活动表移除
+            return false;
+        }
+        // 变量解析：表达式里的 `name` → 读材质 `$name` 变量
+        let mut resolve = |name: &str| -> f32 {
+            let full = format!("${name}");
+            let c = cstr_of(&full);
+            unsafe { material::get_float(material::find_var(material, &c)) }
+        };
+        match expr::eval_logic(&self.expr, &mut resolve) {
+            Ok(v) => {
+                let r = if v != 0.0 { 1 } else { 0 };
+                material::set_int(out, r);
+                #[cfg(debug_assertions)]
+                {
+                    if r != self.last_result {
+                        log(&format!(
+                            "logic[{}]: '{}' = {}",
+                            material::get_name(material).unwrap_or_else(|| "?".into()),
+                            self.expr,
+                            r
+                        ));
+                        self.last_result = r;
+                    }
+                }
+            }
+            Err(e) => {
+                log(&format!("logic: expr '{}' error: {}", self.expr, e.0));
+            }
+        }
+        true
+    }
+}
+
+/// l4nrp_delay_set —— 检测 `trigger` 变量（整型）非 0 的**上升沿**后，启动一个计时器，
+/// 延迟 `delay` 毫秒后把 `value` 变量（整型）的值复制到 `output`；`handle`（可选）写出本次
+/// 计时器的 **UUID v4 字符串手柄**（无计时器时写空字符串），供其它代理（如 `l4nrp_delay_abort`）中断。
+///
+/// 计时器由 [`material.rs`](material.rs) 的全局注册表托管：到期由 `run_timers` 每帧触发
+/// （先取出再释放锁，见 AGENTS.md）。`trigger` 未先回到 0 再置位前不会重复触发。
+struct DelaySetProxy {
+    trigger: String,
+    delay_ms: u64,
+    output: String,
+    value: String, // 变量名：到期后读取其整型值并写入 output
+    handle: String, // 可选；空 = 不写手柄变量
+    last_trigger: i32,
+    current: String, // 当前计时器 UUID 手柄；空 = 无
+    trigger_n: CString,
+    output_n: CString,
+    value_n: CString,
+    handle_n: CString,
+}
+impl Default for DelaySetProxy {
+    fn default() -> Self {
+        Self {
+            trigger: "$trigger_var".into(),
+            delay_ms: 1000,
+            output: "$result_var".into(),
+            value: "$value_var".into(),
+            handle: String::new(),
+            last_trigger: 0,
+            current: String::new(),
+            trigger_n: cstr_of("$trigger_var"),
+            output_n: cstr_of("$result_var"),
+            value_n: cstr_of("$value_var"),
+            handle_n: cstr_of(""),
+        }
+    }
+}
+impl DelaySetProxy {
+    /// 写手柄状态变量（可选，未配置则跳过）。UUID 为字符串，写入字符串类型变量。
+    fn write_handle(&self, material: *mut c_void, h: &str) {
+        if self.handle.is_empty() {
+            return;
+        }
+        let c = cstr_of(h);
+        unsafe {
+            let v = material::find_var(material, &self.handle_n);
+            if !v.is_null() {
+                material::set_string(v, &c);
+            }
+        }
+    }
+}
+impl Proxy for DelaySetProxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "trigger" | "input" | "src" | "condition" | "flag" => {
+                set_kv(&mut self.trigger, &mut self.trigger_n, value)
+            }
+            "delay" | "delay_ms" | "time" | "ms" => {
+                self.delay_ms = value.trim().parse().unwrap_or(self.delay_ms)
+            }
+            "output" | "result" | "result_var" | "target" => {
+                set_kv(&mut self.output, &mut self.output_n, value)
+            }
+            "value" | "set" | "to" | "value_var" => {
+                set_kv(&mut self.value, &mut self.value_n, value)
+            }
+            "handle" | "handle_var" | "timer_handle" | "running" | "busy" | "active" => {
+                set_kv(&mut self.handle, &mut self.handle_n, value)
+            }
+            _ => {}
+        }
+    }
+    // 依赖每帧时间推进，需要每帧执行
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+        if material.is_null() {
+            return false;
+        }
+        let out = material::find_var(material, &self.output_n);
+        if out.is_null() {
+            // 材质失效/变量缺失 → 从活动表移除，并清理挂起的计时器（防泄漏/悬垂）
+            if !self.current.is_empty() {
+                material::abort_timer(&self.current);
+                self.current.clear();
+            }
+            return false;
+        }
+        let t = material::get_int(material::find_var(material, &self.trigger_n));
+
+        // 同步手柄状态：运行中写回手柄，否则写空字符串
+        if !self.current.is_empty() {
+            if material::timer_active(&self.current) {
+                self.write_handle(material, &self.current);
+            } else {
+                // 已到期（run_timers 已写 output）/ 被 l4nrp_delay_abort 中断
+                self.current.clear();
+                self.write_handle(material, "");
+            }
+        } else {
+            self.write_handle(material, "");
+        }
+
+        // 上升沿启动新计时器（注册表托管，返回 UUID 手柄）
+        if t != 0 && self.last_trigger == 0 && self.current.is_empty() {
+            self.current = material::start_timer(
+                material,
+                self.output_n.clone(),
+                self.value_n.clone(),
+                self.delay_ms,
+            );
+            self.write_handle(material, &self.current);
+            #[cfg(debug_assertions)]
+            {
+                log(&format!(
+                    "delay_set: timer {} started ({}ms), trigger={}",
+                    self.current, self.delay_ms, t
+                ));
+            }
+        }
+        self.last_trigger = t;
+        true
+    }
+}
+
+/// l4nrp_delay_abort —— 当 `trigger`（整型）非 0 时，中断 `handle` 变量指定的计时器
+/// （该手柄由 `l4nrp_delay_set` 的 `handle` 参数写入）。
+struct DelayAbortProxy {
+    trigger: String,
+    handle: String,
+    trigger_n: CString,
+    handle_n: CString,
+}
+impl Default for DelayAbortProxy {
+    fn default() -> Self {
+        Self {
+            trigger: "$trigger_var".into(),
+            handle: "$timer_handle".into(),
+            trigger_n: cstr_of("$trigger_var"),
+            handle_n: cstr_of("$timer_handle"),
+        }
+    }
+}
+impl Proxy for DelayAbortProxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "trigger" | "input" | "src" | "condition" | "flag" => {
+                set_kv(&mut self.trigger, &mut self.trigger_n, value)
+            }
+            "handle" | "handle_var" | "timer" | "timer_handle" => {
+                set_kv(&mut self.handle, &mut self.handle_n, value)
+            }
+            _ => {}
+        }
+    }
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+        if material.is_null() {
+            return false;
+        }
+        let t = material::get_int(material::find_var(material, &self.trigger_n));
+        // handle 变量是字符串类型（UUID v4），用 get_string 读取
+        let h = material::get_string(material::find_var(material, &self.handle_n));
+        if t != 0 {
+            if let Some(h) = h {
+                if !h.is_empty() && material::abort_timer(&h) {
+                    #[cfg(debug_assertions)]
+                    {
+                        log(&format!("delay_abort: aborted timer {h}"));
+                    }
+                }
             }
         }
         true
@@ -850,6 +1104,9 @@ unsafe fn try_bind_and_install() {
     material::register_proxy::<StrReplaceProxy>("l4nrp_str_replace");
     material::register_proxy::<Vec3Proxy>("l4nrp_vec3");
     material::register_proxy::<MathProxy>("l4nrp_math");
+    material::register_proxy::<LogicProxy>("l4nrp_logic");
+    material::register_proxy::<DelaySetProxy>("l4nrp_delay_set");
+    material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
     log(&format!(
         "registered proxies: {:?}",
         material::registered_names()
