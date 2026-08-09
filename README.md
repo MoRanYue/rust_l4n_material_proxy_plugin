@@ -30,25 +30,48 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 在材质的 VMT 文件 `"Proxies"` 块里写上代理名，以及可选参数：
 
 ```text
-// some_material.vmt
-"UnlitGeneric"
-{
+// rainbow.vmt
+"UnlitGeneric" {
     "$basetexture" "vgui/common/l4d_spinner"
-    "$color"       "[1 1 1]"
-    "$src_var_1"   "1.0"        // does_equal 输入
-    "$src_var_2"   "1.0"
-    "$result_var"  "0"
-    "Proxies"
-    {
-        "l4nrp_does_equal"
-        {
-            "src_a"   "$src_var_1"
-            "src_b"   "$src_var_2"
-            "result"  "$result_var"
+    "$color" "[1 1 1]"
+
+    "$speed" "0.5"
+    "$offset" "0"
+
+    "$time" "0"
+    "$theta" "0"
+    "$r" "0"
+    "$g" "0"
+    "$b" "0"
+    "Proxies" {
+        "CurrentTime" {
+            "resultVar" "$time"
         }
-        "l4nrp_print_variable"
-        {
-            "src_var" "$result_var"
+        "l4nrp_math" {
+            "expr" "$time * $speed"
+            "result_var" "$theta"
+        }
+        "l4nrp_math" {
+            "expr" "0.5 + 0.5 * sin($theta)"
+            "result_var" "$r"
+        }
+        "l4nrp_math" {
+            "expr" "0.5 + 0.5 * sin($theta + 2 * pi() / 3)"
+            "result_var" "$g"
+        }
+        "l4nrp_math" {
+            "expr" "0.5 + 0.5 * sin($theta + 4 * pi() / 3)"
+            "result_var" "$b"
+        }
+        "l4nrp_vec3" {
+            "src_x" "$r"
+            "src_y" "$g"
+            "src_z" "$b"
+            "result_var" "$color"
+        }
+        "l4nrp_print_variable" {
+            "var" "$color"
+            "type" "vector"
         }
     }
 }

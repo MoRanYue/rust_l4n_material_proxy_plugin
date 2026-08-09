@@ -52,6 +52,15 @@
     "$str_result"  "concat result"
     "$str_result2" "replace result"
 
+    // l4nrp_str_slice 的输入 / 输出变量（字符串 + 整型 start / len）
+    "$str_slice"     "hello world"
+    "$slice_start"   "0" // 整型：起始字符位置
+    "$slice_len"     "5" // 整型：截取字符数
+    "$str_slice_result" "slice result"
+
+    // l4nrp_vmt_name 的输出变量（字符串，材质加载时写入材质文件名，如 "Example"）
+    "$mat_name" ""
+
     "Proxies"
     {
         // 1) l4nrp_color_ramp —— 演示可配置参数（打印到日志）
@@ -175,6 +184,24 @@
         {
             "trigger" "$abort_trigger"
             "handle"  "$timer_handle"
+        }
+
+        // 14) l4nrp_str_slice —— 每帧从 $str_slice 的 $slice_start（整型起始位置）开始，
+        //     截取 $slice_len（整型长度）个字符 → $str_slice_result
+        //     （按字符截取，越界自动 clamp；start/len 可用 l4nrp_math 等每帧驱动）
+        "l4nrp_str_slice"
+        {
+            "src"       "$str_slice"
+            "src_start" "$slice_start"
+            "src_len"   "$slice_len"
+            "result"    "$str_slice_result"
+        }
+
+        // 15) l4nrp_vmt_name —— 材质加载时把材质文件名（material::get_name，
+        //     即本文件去掉 .vmt 后的路径，如 "Example"）写入 $mat_name
+        "l4nrp_vmt_name"
+        {
+            "result" "$mat_name"
         }
     }
 }

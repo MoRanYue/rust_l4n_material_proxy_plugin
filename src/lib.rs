@@ -501,6 +501,130 @@ impl Proxy for PrintVariable {
     }
 }
 
+/// l4nrp_str_slice —— 从变量 `src` 的 `src_start` 开始，截取长度 `src_len` 的字符串切片并写入 `result`。
+struct StrSliceProxy {
+    src: String,
+    src_start: String,
+    src_len: String,
+    result: String,
+    last_result: CString,
+    src_n: CString,
+    src_start_n: CString,
+    src_len_n: CString,
+    result_n: CString,
+}
+impl Default for StrSliceProxy {
+    fn default() -> Self {
+        Self {
+            src: "$src_var".into(),
+            src_start: "$src_start".into(),
+            src_len: "$src_len".into(),
+            result: "$result_var".into(),
+            last_result: cstr_of(""),
+            src_n: cstr_of("$src_var"),
+            src_start_n: cstr_of("$src_start"),
+            src_len_n: cstr_of("$src_len"),
+            result_n: cstr_of("$result_var"),
+        }
+    }
+}
+impl Proxy for StrSliceProxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "src" | "src_var" | "input" | "source" => set_kv(&mut self.src, &mut self.src_n, value),
+            "src_start" | "start" | "offset" | "begin" => set_kv(&mut self.src_start, &mut self.src_start_n, value),
+            "src_len" | "len" | "length" | "count" | "size" => set_kv(&mut self.src_len, &mut self.src_len_n, value),
+            "result" | "result_var" | "output" => set_kv(&mut self.result, &mut self.result_n, value),
+            _ => {}
+        }
+    }
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+        if material.is_null() {
+            return false;
+        }
+        let s = material::get_string(material::find_var(material, &self.src_n)).unwrap_or_default();
+        // src_start / src_len 为整型变量：起始位置 / 截取长度
+        let start = material::get_int(material::find_var(material, &self.src_start_n));
+        let len = material::get_int(material::find_var(material, &self.src_len_n));
+        let out = material::find_var(material, &self.result_n);
+        if out.is_null() {
+            // 材质失效/变量缺失 → 从活动表移除
+            return false;
+        }
+        // 按字符（而非字节）切片，避免 UTF-8 边界 panic；越界 clamp 到合法范围
+        let chars: Vec<char> = s.chars().collect();
+        let n = chars.len() as i32;
+        let start = start.clamp(0, n);
+        let len = len.clamp(0, n - start);
+        let v: String = chars[start as usize..(start + len) as usize].iter().collect();
+        let c = cstr_of(&v);
+        material::set_string(out, &c);
+        #[cfg(debug_assertions)]
+        {
+            if self.last_result.to_bytes() != v.as_bytes() {
+                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                log(&format!(
+                    "str_slice[{}]: {}='{s}' start={start} len={len} -> {}='{v}'",
+                    mat_name, self.src, self.result
+                ));
+                self.last_result = cstr_of(&v);
+            }
+        }
+        true
+    }
+}
+
+/// l4nrp_vmt_name —— 把材质自身文件名（`material::get_name`，即 VMT 去掉 `.vmt` 后的路径）
+/// 写入 `result` 变量（字符串类型）。材质名不会变化，仅材质加载时执行一次。
+struct VmtName {
+    result: String,
+    last_result: CString,
+    result_n: CString,
+}
+impl Default for VmtName {
+    fn default() -> Self {
+        Self {
+            result: "$result_var".into(),
+            last_result: cstr_of(""),
+            result_n: cstr_of("$result_var"),
+        }
+    }
+}
+impl Proxy for VmtName {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "result" | "result_var" | "output" => set_kv(&mut self.result, &mut self.result_n, value),
+            _ => {}
+        }
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+        if material.is_null() {
+            return false;
+        }
+        let out = material::find_var(material, &self.result_n);
+        if out.is_null() {
+            return false;
+        }
+        let name = material::get_name(material).unwrap_or_default();
+        let c = cstr_of(&name);
+        material::set_string(out, &c);
+        #[cfg(debug_assertions)]
+        {
+            if self.last_result.to_bytes() != name.as_bytes() {
+                log(&format!(
+                    "vmt_name[{}]: {}='{name}'",
+                    name, self.result
+                ));
+                self.last_result = cstr_of(&name);
+            }
+        }
+        true
+    }
+}
+
 /// l4nrp_str_concat —— 拼接 2 个字符串变量（`src_a` + `src_b` → `result`）。
 struct StrConcatProxy {
     src_a: String,
@@ -1102,6 +1226,8 @@ unsafe fn try_bind_and_install() {
     material::register_proxy::<PrintVariable>("l4nrp_print_variable");
     material::register_proxy::<StrConcatProxy>("l4nrp_str_concat");
     material::register_proxy::<StrReplaceProxy>("l4nrp_str_replace");
+    material::register_proxy::<StrSliceProxy>("l4nrp_str_slice");
+    material::register_proxy::<VmtName>("l4nrp_vmt_name");
     material::register_proxy::<Vec3Proxy>("l4nrp_vec3");
     material::register_proxy::<MathProxy>("l4nrp_math");
     material::register_proxy::<LogicProxy>("l4nrp_logic");

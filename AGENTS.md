@@ -165,6 +165,8 @@ material::register_proxy::<IsInRangeProxy>("l4nrp_is_in_range");
 material::register_proxy::<PrintVariable>("l4nrp_print_variable");
 material::register_proxy::<StrConcatProxy>("l4nrp_str_concat");
 material::register_proxy::<StrReplaceProxy>("l4nrp_str_replace");
+material::register_proxy::<StrSliceProxy>("l4nrp_str_slice");
+material::register_proxy::<VmtName>("l4nrp_vmt_name");
 material::register_proxy::<MathProxy>("l4nrp_math");
 material::register_proxy::<LogicProxy>("l4nrp_logic");
 material::register_proxy::<Vec3Proxy>("l4nrp_vec3");
@@ -184,6 +186,14 @@ material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
 > `str_replace`（`src` 里把 `search` 全替换为 `replace` →`result`）用 `material::get_string` 读、
 > `material::set_string` 写（均 `per_frame`，每次先复制指针再释放锁，见上）。`str_replace` 的
 > `search`/`replace` 若以 `$` 开头当作变量名读取，否则当作字面字符串。
+>
+> **`l4nrp_str_slice` 字符串切片**：`src`（`get_string` 读）**按字符**（非字节，避免 UTF-8 边界
+> panic）截取切片：`src_start`（整型，`get_int`，起始字符位置，越界 clamp 到 `[0, 长度]`）起，
+> `src_len`（整型，`get_int`，截取字符数，`<=0` 得空串，超出剩余则到末尾）→`result`
+> （`set_string`，每帧）。
+>
+> **`l4nrp_vmt_name` 材质名**：材质加载时把 `material::get_name(this)`（VMT 去掉 `.vmt` 后的路径，
+> 如 `"Example"`）写入 `result`（`set_string`，一次性，非 `per_frame`）。
 >
 > **`l4nrp_math` 数学表达式**：表达式由 [`src/expr.rs`](src/expr.rs) `eval_math` 求值
 > （无第三方依赖），**仅支持数学**：`+ - * / % ^`、括号、一元负号与常用函数
@@ -211,8 +221,9 @@ material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
   （位于 [`src/lib.rs`](src/lib.rs)，可复用）。
 - 演示代理见 [`src/lib.rs`](src/lib.rs)：`ColorRampProxy` / `LogPulseProxy` / `ForceRedProxy` /
   `DoesEqualProxy` / `CompareProxy` / `IsInRangeProxy` / `PrintVariable` / `StrConcatProxy` /
-  `StrReplaceProxy` / `MathProxy` / `LogicProxy` / `Vec3Proxy` / `DelaySetProxy` / `DelayAbortProxy`。
-- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 14 个代理及其参数）。
+  `StrReplaceProxy` / `StrSliceProxy` / `VmtName` / `MathProxy` / `LogicProxy` / `Vec3Proxy` /
+  `DelaySetProxy` / `DelayAbortProxy`。
+- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 16 个代理及其参数）。
 
 ## 构建 / 部署 / 验证
 
