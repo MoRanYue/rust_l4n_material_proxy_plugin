@@ -559,6 +559,28 @@ pub unsafe fn install(parse_addr: usize) -> bool {
     if parse_addr == 0 {
         return false;
     }
+    let original_entry: [u8; 9] = [0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x08, 0x04, 0x00, 0x00];
+    let mut head: [u8; 5] = [0; 5];
+    core::ptr::copy_nonoverlapping(parse_addr as *const u8, head.as_mut_ptr(), 5);
+    if head[0] == 0xE9 {
+        // 链式接管：FUN_10002d50 已被其它插件（如 rust_l4n_node_texture_plugin）detour，
+        // 解析入口 E9 rel32 得到先加载者 hook 作为下一跳，再把自己的 hook patch 到入口。
+        // 两个插件各自处理自己的代理，形成 hook 链，避免 trampoline 复制对方 jmp 崩溃。
+        let rel = i32::from_le_bytes([head[1], head[2], head[3], head[4]]);
+        let next = parse_addr.wrapping_add(5).wrapping_add(rel as usize);
+        ORIGINAL_PROXY_PARSE = next;
+        crate::log(&format!(
+            "install: FUN_10002d50 already hooked at 0x{:x}, chaining detour",
+            next
+        ));
+        return hook_function(parse_addr, proxy_parse_hook as *const () as usize);
+    }
+    let mut cur: [u8; 9] = [0; 9];
+    core::ptr::copy_nonoverlapping(parse_addr as *const u8, cur.as_mut_ptr(), 9);
+    if cur != original_entry {
+        crate::log("install: FUN_10002d50 entry unexpected, skipping install");
+        return false;
+    }
     let tramp = make_trampoline(parse_addr, 9);
     if tramp == 0 {
         return false;
@@ -638,7 +660,12 @@ unsafe extern "thiscall" fn proxy_parse_hook(this: *mut c_void, kv: *mut c_void)
     if handled {
         crate::log(&format!("apply_proxies: 0x{:x} handled", this as usize));
     }
-    // 总是透传（我们的代理已摘除，可与内置代理共存）
-    let orig: unsafe extern "thiscall" fn(*mut c_void, *mut c_void) = transmute(ORIGINAL_PROXY_PARSE);
+    // 总是透传（我们的代理已摘除，可与内置代理共存）。
+    // 加固：链式下一跳（trampoline 或先加载者 hook）无效时安全返回，避免调用坏指针。
+    let orig_ptr = core::ptr::addr_of!(ORIGINAL_PROXY_PARSE).read();
+    if orig_ptr == 0 || !crate::kv::is_readable(orig_ptr as *const c_void) {
+        return;
+    }
+    let orig: unsafe extern "thiscall" fn(*mut c_void, *mut c_void) = transmute(orig_ptr);
     orig(this, kv);
 }

@@ -242,6 +242,10 @@ cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/e
 
 ## 已知问题
 
+- v5.5：**链式 detour 兼容**：`install()` 检测 `FUN_10002d50` 入口为 `E9 rel32`（已被其它
+  插件如 `rust_l4n_node_texture_plugin` hook）时，解析出先加载者 hook 作为下一跳
+  （`ORIGINAL_PROXY_PARSE`），再把自己 patch 到入口；`proxy_parse_hook` 在下一跳无效时
+  安全返回。这样可与 `rust_l4n_node_texture_plugin` **同时使用**（各自处理自己的代理）。
 - v5.1：处理我们的代理后从 `"Proxies"` 链表**摘除**再透传，因此可与原版/L4N 材质代理共存（同一
   `"Proxies"` 块里既有 `Sine`/`Multiply` 等内置代理，也有 `l4nrp_*`）。摘除只改一次材质 KeyValues
   树（仅移除我们的代理节点），对引擎其余逻辑无影响。
