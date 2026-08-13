@@ -63,30 +63,6 @@
 
     "Proxies"
     {
-        // 1) l4nrp_color_ramp —— 演示可配置参数（打印到日志）
-        "l4nrp_color_ramp"
-        {
-            "color_r" "1.0"
-            "color_g" "0.5"
-            "color_b" "0.25"
-            "rate"   "2.0"
-            "scale"  "1.5"
-            "flag"   "1"
-            "text"   "hello from Example.vmt"
-        }
-
-        // 2) l4nrp_log_pulse —— 演示带 enabled 开关的参数（flag=1 才打印）
-        "l4nrp_log_pulse"
-        {
-            "flag"    "1"
-            "color_b" "0.8"
-            "rate"    "1.0"
-        }
-
-        // 3) l4nrp_force_red —— 无参数；把 $color 写成纯红 (1,0,0)
-        "l4nrp_force_red"
-        {}
-
         // 4) l4nrp_does_equal —— 每帧比较 $src_var_1 与 $src_var_2，
         //    相等则 $result_var = 1，否则 = 0
         "l4nrp_does_equal"
