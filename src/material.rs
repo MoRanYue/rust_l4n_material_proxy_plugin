@@ -10,8 +10,13 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use uuid::Uuid;
+use windows::Win32::Foundation::GetLastError;
+use windows::core::s;
+use windows::Win32::System::LibraryLoader::GetModuleHandleA;
+use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualProtect};
 
-use crate::kv::{is_readable, Proxy};
+use crate::error::{MaterialError, PluginError};
+use crate::kv::Proxy;
 
 // ---------- IMaterial / IMaterialVar 访问（L4D2 materialsystem.dll，逆向确认） ----------
 const MAT_FIND_VAR: usize = 0x2c;
@@ -40,21 +45,25 @@ type GetVecFn = unsafe extern "thiscall" fn(*const c_void, *mut f32, i32);
 ///
 /// # Safety
 /// `mat` 必须是有效的 `IMaterial*`。
-pub unsafe fn find_var(mat: *mut c_void, name: &CStr) -> *mut c_void {
+pub unsafe fn find_var(mat: *mut c_void, name: &CStr) -> Result<*mut c_void, PluginError> {
     if mat.is_null() {
-        return core::ptr::null_mut();
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(mat as *const *const c_void);
     if vft.is_null() {
-        return core::ptr::null_mut();
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: FindVarFn = transmute(*((vft as *const usize).add(MAT_FIND_VAR / 4)));
-    let mut found: u8 = 0;
+    let mut found = 0;
     let v = f(mat, name.as_ptr(), &mut found, 1);
     if found != 0 {
-        v
-    } else {
-        core::ptr::null_mut()
+        Ok(v)
+    }
+    else {
+        Err(PluginError::Material(MaterialError::VariableNotFound(
+            Box::from(name.to_string_lossy().into_owned()),
+            Box::from(get_name(mat).unwrap_or(format!("0x{:x}", mat as usize)))
+        )))
     }
 }
 
@@ -65,99 +74,106 @@ pub unsafe fn find_var(mat: *mut c_void, name: &CStr) -> *mut c_void {
 /// `thiscall(this=IMaterial*) -> const char*`。
 /// # Safety
 /// `mat` 必须是有效的 `IMaterial*`。
-pub unsafe fn get_name(mat: *mut c_void) -> Option<String> {
+pub unsafe fn get_name(mat: *mut c_void) -> Result<String, PluginError> {
     if mat.is_null() {
-        return None;
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(mat as *const *const c_void);
     if vft.is_null() {
-        return None;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: GetNameFn = transmute(*((vft as *const usize).add(0)));
     let p = f(mat);
     if p.is_null() {
-        return None;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
-    // 防坏指针（strlen 崩溃）
-    if !crate::kv::is_readable(p as *const c_void) {
-        return None;
-    }
-    Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+    crate::kv::test_readable(p as *const c_void)?;
+
+    Ok(CStr::from_ptr(p).to_string_lossy().into_owned())
 }
 
 /// 设置 IMaterialVar 的浮点值（等价 `SetFloatValue`，vtable +0x0c）。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
-pub unsafe fn set_float(var: *mut c_void, value: f32) {
+pub unsafe fn set_float(var: *mut c_void, value: f32) -> Result<(), PluginError> {
     if var.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(var as *const *const c_void);
     if vft.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: SetFloatFn = transmute(*((vft as *const usize).add(MATVAR_SET_FLOAT / 4)));
     f(var, value);
+
+    Ok(())
 }
 
 /// 设置 IMaterialVar 的整数值（等价 `SetIntValue`，vtable +0x10）。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
-pub unsafe fn set_int(var: *mut c_void, value: i32) {
+pub unsafe fn set_int(var: *mut c_void, value: i32) -> Result<(), PluginError> {
     if var.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(var as *const *const c_void);
     if vft.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: SetIntFn = transmute(*((vft as *const usize).add(MATVAR_SET_INT / 4)));
     f(var, value);
+
+    Ok(())
 }
 
 /// 设置 IMaterialVar 的字符串值（等价 `SetStringValue`，vtable +0x14）。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
-pub unsafe fn set_string(var: *mut c_void, value: &CStr) {
+pub unsafe fn set_string(var: *mut c_void, value: &CStr) -> Result<(), PluginError> {
     if var.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(var as *const *const c_void);
     if vft.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: SetStringFn = transmute(*((vft as *const usize).add(MATVAR_SET_STRING / 4)));
     f(var, value.as_ptr());
+
+    Ok(())
 }
 
 /// 设置 IMaterialVar 的向量值（等价 `SetVecValue(float*, n)`，vtable +0x30）。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`；`values` 长度 >= `n`。
-pub unsafe fn set_vec(var: *mut c_void, values: &[f32]) {
+pub unsafe fn set_vec(var: *mut c_void, values: &[f32]) -> Result<(), PluginError> {
     if var.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(var as *const *const c_void);
     if vft.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: SetVecFn = transmute(*((vft as *const usize).add(MATVAR_SET_VEC / 4)));
     f(var, values.as_ptr(), values.len() as i32);
+
+    Ok(())
 }
 
 /// 读取 IMaterialVar 的浮点值（等价 `GetFloatValue`，vtable +0x6c）。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
-pub unsafe fn get_float(var: *mut c_void) -> f32 {
+pub unsafe fn get_float(var: *mut c_void) -> Result<f32, PluginError> {
     if var.is_null() {
-        return 0.0;
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(var as *const *const c_void);
     if vft.is_null() {
-        return 0.0;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: GetFloatFn = transmute(*((vft as *const usize).add(MATVAR_GET_FLOAT / 4)));
-    f(var)
+
+    Ok(f(var))
 }
 
 /// 读取 IMaterialVar 的字符串值（等价 `GetStringValue()`，vtable +0x18，thiscall 返回 `const char*`）。
@@ -168,56 +184,55 @@ pub unsafe fn get_float(var: *mut c_void) -> f32 {
 /// （+0x0c=SetFloat、+0x14=SetString、+0x6c=GetFloat、+0x70=GetVec）。顺带确认
 /// `GetIntValue` = +0x68（`FUN_10019c60: return param_1[2]`）。
 ///
-/// 返回字符串副本；坏指针/不可读内存返回 `None`（防 strlen 崩溃）。
+/// 返回字符串副本；坏指针/不可读内存返回 `Err`（防 strlen 崩溃）。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
-pub unsafe fn get_string(var: *mut c_void) -> Option<String> {
+pub unsafe fn get_string(var: *mut c_void) -> Result<String, PluginError> {
     if var.is_null() {
-        return None;
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(var as *const *const c_void);
     if vft.is_null() {
-        return None;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: GetStringFn = transmute(*((vft as *const usize).add(MATVAR_GET_STRING / 4)));
     let p = f(var);
-    if p.is_null() {
-        return None;
-    }
-    if !crate::kv::is_readable(p as *const c_void) {
-        return None;
-    }
-    Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+    crate::kv::test_readable(p as *const c_void)?;
+
+    Ok(CStr::from_ptr(p).to_string_lossy().into_owned())
 }
 
 /// 读取 IMaterialVar 的整数值（等价 `GetIntValue()`，vtable +0x68，thiscall 返回 `int`）。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
-pub unsafe fn get_int(var: *mut c_void) -> i32 {
+pub unsafe fn get_int(var: *mut c_void) -> Result<i32, PluginError> {
     if var.is_null() {
-        return 0;
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(var as *const *const c_void);
     if vft.is_null() {
-        return 0;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: GetIntFn = transmute(*((vft as *const usize).add(MATVAR_GET_INT / 4)));
-    f(var)
+
+    Ok(f(var))
 }
 
 /// 读取 IMaterialVar 的向量值（等价 `GetVecValue(float*, n)`，vtable +0x70）。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
-pub unsafe fn get_vec(var: *mut c_void, out: &mut [f32; 3]) {
+pub unsafe fn get_vec(var: *mut c_void, out: &mut [f32; 3]) -> Result<(), PluginError> {
     if var.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::InvalidMaterial));
     }
     let vft = *(var as *const *const c_void);
     if vft.is_null() {
-        return;
+        return Err(PluginError::Material(MaterialError::UnexpectedInstance));
     }
     let f: GetVecFn = transmute(*((vft as *const usize).add(MATVAR_GET_VEC / 4)));
     f(var, out.as_mut_ptr(), 3);
+
+    Ok(())
 }
 
 /// 读取 IMaterialVar 向量的第 `index` 个分量（float）。
@@ -227,13 +242,13 @@ pub unsafe fn get_vec(var: *mut c_void, out: &mut [f32; 3]) {
 /// （或 `GetVecValueInternal(+0x74)` 返回内部 `float*` 后读 `[n]`）。此函数封装前者。
 /// # Safety
 /// `var` 必须是 `find_var` 返回的有效 `IMaterialVar*`。
-pub unsafe fn get_vec_component(var: *mut c_void, index: usize) -> f32 {
+pub unsafe fn get_vec_component(var: *mut c_void, index: usize) -> Result<f32, PluginError> {
     let mut o = [0.0f32; 3];
-    get_vec(var, &mut o);
+    get_vec(var, &mut o)?;
     if index < 3 {
-        o[index]
+        Ok(o[index])
     } else {
-        0.0
+        Err(PluginError::Material(MaterialError::VectorAccessOutOfBound(index, 3)))
     }
 }
 
@@ -297,11 +312,11 @@ pub fn run_active_proxies() {
         let mut a = ACTIVE.lock().unwrap();
         a.iter_mut().map(|e| (e.id, e.material, &mut e.proxy as *mut Box<dyn Proxy>)).collect()
     };
-    // bind 返回 false = 材质失效/变量缺失 → 从活动表移除该条目
+    // bind 返回 Err = 材质失效/变量缺失 → 从活动表移除该条目
     let mut stale: Vec<u64> = Vec::new();
     for (id, m, p) in items {
-        let ok = unsafe { (&mut *p).bind(m) };
-        if !ok {
+        if let Err(e) = unsafe { (&mut *p).bind(m) } {
+            crate::log(&e.to_string());
             stale.push(id);
         }
     }
@@ -369,23 +384,25 @@ fn run_timers() {
     }
     for t in fired {
         // 防悬垂：材质已不可读（被引擎卸载/替换）则丢弃该计时器，避免解引用坏指针崩溃
-        if !is_readable(t.material as *const c_void) {
+        if crate::kv::test_readable(t.material as *const c_void).is_err() {
             continue;
         }
         unsafe {
-            let out = find_var(t.material, &t.output_n);
-            if !out.is_null() {
-                let val = get_int(find_var(t.material, &t.value_n));
-                set_int(out, val);
+            match find_var(t.material, &t.output_n) {
+                Ok(out) => match find_var(t.material, &t.value_n) {
+                    Ok(value_var) => match get_int(value_var) {
+                        Ok(v) => match set_int(out, v) {
+                            Ok(()) => (),
+                            Err(e) => crate::log(&e.to_string()),
+                        },
+                        Err(e) => crate::log(&e.to_string()),
+                    },
+                    Err(e) => crate::log(&e.to_string()),
+                },
+                Err(e) => crate::log(&e.to_string()),
             }
         }
     }
-}
-
-// ---------- 引擎 KeyValues 函数（materialsystem.dll RVA） ----------
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn GetModuleHandleA(lp: *const u8) -> *mut c_void;
 }
 
 type FindKeyFn = unsafe extern "thiscall" fn(*mut c_void, *const c_char, u8) -> *mut c_void;
@@ -394,7 +411,7 @@ type NextSiblingFn = unsafe extern "fastcall" fn(*mut c_void) -> *mut c_void;
 type GetKeyNameFn = unsafe extern "fastcall" fn(*mut c_void) -> *const c_char;
 
 fn ms_base() -> usize {
-    unsafe { GetModuleHandleA(b"materialsystem.dll\0".as_ptr()) as usize }
+    unsafe { GetModuleHandleA(s!("materialsystem.dll")).unwrap().0 as usize }
 }
 
 unsafe fn ms_fn(rva: usize) -> usize {
@@ -420,7 +437,7 @@ unsafe fn parse_proxy_params(proxy: &mut dyn Proxy, node: *mut c_void) {
         let name_ptr = get_name(arg);
         // +0x04 是值字符串指针（const char*），见 AGENTS.md
         let val_ptr = *(arg.add(0x04) as *const *const c_char);
-        if !name_ptr.is_null() && !val_ptr.is_null() && is_readable(val_ptr as *const c_void) {
+        if !name_ptr.is_null() && !val_ptr.is_null() && crate::kv::test_readable(val_ptr as *const c_void).is_ok() {
             let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
             let val = CStr::from_ptr(val_ptr).to_string_lossy().into_owned();
             proxy.apply_kv(&name, &val);
@@ -507,63 +524,54 @@ unsafe fn apply_proxies(material: *mut c_void, kv: *mut c_void) -> bool {
 }
 
 // ---------- detour hook（FUN_10002d50） ----------
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn VirtualProtect(lp: *mut c_void, dw_size: usize, fl_new: u32, lp_old: *mut u32) -> i32;
-    fn VirtualAlloc(lp: *mut c_void, dw_size: usize, fl_type: u32, fl_prot: u32) -> *mut c_void;
-}
-const MEM_COMMIT: u32 = 0x1000;
-const MEM_RESERVE: u32 = 0x2000;
-const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-
 // 原始 FUN_10002d50（trampoline）与 hook 目标
 static mut ORIGINAL_PROXY_PARSE: usize = 0;
 static mut HOOKED_TARGET: usize = 0;
 static mut HOOKED_SAVED: [u8; 5] = [0; 5];
 
 /// 改写 `target` 前 5 字节为 `E9 rel32`（近 JMP 到 `replacement`）。保存原字节。
-unsafe fn hook_function(target: usize, replacement: usize) -> bool {
+unsafe fn hook_function(target: usize, replacement: usize) -> Result<(), PluginError> {
     core::ptr::copy_nonoverlapping(
         target as *const u8,
         core::ptr::addr_of_mut!(HOOKED_SAVED) as *mut u8,
-        5,
+        5
     );
-    let mut old_prot: u32 = 0;
-    if VirtualProtect(target as *mut c_void, 5, PAGE_EXECUTE_READWRITE, &mut old_prot) == 0 {
-        return false;
-    }
+    let mut old_prot = std::mem::zeroed();
+    VirtualProtect(target as *mut c_void, 5, PAGE_EXECUTE_READWRITE, &mut old_prot)?;
     let rel = replacement.wrapping_sub(target + 5) as i32;
     *(target as *mut u8) = 0xE9;
     *((target + 1) as *mut i32) = rel;
-    let mut tmp: u32 = 0;
-    let _ = VirtualProtect(target as *mut c_void, 5, old_prot, &mut tmp);
+    let mut tmp = std::mem::zeroed();
+    VirtualProtect(target as *mut c_void, 5, old_prot, &mut tmp).ok();
     HOOKED_TARGET = target;
-    true
+
+    Ok(())
 }
 
 /// 生成 trampoline：复制 `target` 前 `patch_len` 字节到可执行内存，再 JMP 回 `target+patch_len`。
-unsafe fn make_trampoline(target: usize, patch_len: usize) -> usize {
-    let mem = VirtualAlloc(core::ptr::null_mut(), 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+unsafe fn make_trampoline(target: usize, patch_len: usize) -> Result<usize, PluginError> {
+    let mem = VirtualAlloc(None, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
     if mem == 0 {
-        return 0;
+        return Err(PluginError::Windows(GetLastError().into()));
     }
     core::ptr::copy_nonoverlapping(target as *const u8, mem as *mut u8, patch_len);
     *((mem + patch_len) as *mut u8) = 0xE9;
     let rel = (target + patch_len).wrapping_sub(mem + patch_len + 5) as i32;
     *((mem + patch_len + 1) as *mut i32) = rel;
-    mem
+
+    Ok(mem)
 }
 
 /// hook `FUN_10002d50`（materialsystem RVA 0x2d50）。入口 9 字节完整指令，trampoline 复制 9 字节。
-pub unsafe fn install(parse_addr: usize) -> bool {
+pub unsafe fn install(parse_addr: usize) -> Result<(), PluginError> {
     if parse_addr == 0 {
-        return false;
+        return Err(PluginError::InvalidPointer);
     }
     let original_entry: [u8; 9] = [0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x08, 0x04, 0x00, 0x00];
     let mut head: [u8; 5] = [0; 5];
     core::ptr::copy_nonoverlapping(parse_addr as *const u8, head.as_mut_ptr(), 5);
     if head[0] == 0xE9 {
-        // 链式接管：FUN_10002d50 已被其它插件（如 rust_l4n_node_texture_plugin）detour，
+        // 链式接管：FUN_10002d50 已被其它插件 detour，
         // 解析入口 E9 rel32 得到先加载者 hook 作为下一跳，再把自己的 hook patch 到入口。
         // 两个插件各自处理自己的代理，形成 hook 链，避免 trampoline 复制对方 jmp 崩溃。
         let rel = i32::from_le_bytes([head[1], head[2], head[3], head[4]]);
@@ -573,39 +581,32 @@ pub unsafe fn install(parse_addr: usize) -> bool {
             "install: FUN_10002d50 already hooked at 0x{:x}, chaining detour",
             next
         ));
+
         return hook_function(parse_addr, proxy_parse_hook as *const () as usize);
     }
     let mut cur: [u8; 9] = [0; 9];
     core::ptr::copy_nonoverlapping(parse_addr as *const u8, cur.as_mut_ptr(), 9);
     if cur != original_entry {
-        crate::log("install: FUN_10002d50 entry unexpected, skipping install");
-        return false;
+        return Err(PluginError::Unexpected(Box::from("FUN_10002d50 entry unexpected")));
     }
-    let tramp = make_trampoline(parse_addr, 9);
-    if tramp == 0 {
-        return false;
-    }
+    let tramp = make_trampoline(parse_addr, 9)?;
     ORIGINAL_PROXY_PARSE = tramp;
-    if !hook_function(parse_addr, proxy_parse_hook as *const () as usize) {
-        return false;
-    }
-    true
+    hook_function(parse_addr, proxy_parse_hook as *const () as usize)
 }
 
 /// 还原被 hook 的函数入口。进程退出前可调用。
 pub unsafe fn uninstall() {
     let target = core::ptr::addr_of!(HOOKED_TARGET).read();
     if target != 0 {
-        let mut old_prot: u32 = 0;
-        if VirtualProtect(target as *mut c_void, 5, PAGE_EXECUTE_READWRITE, &mut old_prot) != 0 {
-            core::ptr::copy_nonoverlapping(
-                core::ptr::addr_of!(HOOKED_SAVED) as *const u8,
-                target as *mut u8,
-                5,
-            );
-            let mut tmp: u32 = 0;
-            let _ = VirtualProtect(target as *mut c_void, 5, old_prot, &mut tmp);
-        }
+        let mut old_prot = std::mem::zeroed();
+        VirtualProtect(target as *mut c_void, 5, PAGE_EXECUTE_READWRITE, &mut old_prot).ok();
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(HOOKED_SAVED) as *const u8,
+            target as *mut u8,
+            5,
+        );
+        let mut tmp = std::mem::zeroed();
+        let _ = VirtualProtect(target as *mut c_void, 5, old_prot, &mut tmp);
     }
 }
 
@@ -623,33 +624,28 @@ unsafe extern "system" fn endscene_hook(this: *mut c_void) -> i32 {
 }
 
 /// patch D3D9 `IDirect3DDevice9::EndScene`（vtable 索引 42），每帧先执行活动代理再透传原函数。
-pub unsafe fn install_d3d_endscene(device: *mut c_void) -> bool {
+pub unsafe fn install_d3d_endscene(device: *mut c_void) -> Result<(), PluginError> {
     if device.is_null() {
-        return false;
+        return Err(PluginError::Unexpected(Box::from("Direct3D device not ready")));
     }
     let vft = *(device as *const *const usize);
     if vft.is_null() {
-        return false;
+        return Err(PluginError::Unexpected(Box::from("Direct3D device not ready")));
     }
     let slot: *mut usize = vft.add(42) as *mut usize;
     let orig = *slot;
     let hook_addr = endscene_hook as *const () as usize;
     if orig == 0 || orig == hook_addr {
-        return false;
+        return Err(PluginError::Unexpected(Box::from("IDirect3DDevice9::EndScene does not exist")));
     }
-    let mut old: u32 = 0;
-    if VirtualProtect(slot as *mut c_void, 4, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
-        return false;
-    }
+    let mut old = std::mem::zeroed();
+    VirtualProtect(slot as *mut c_void, 4, PAGE_EXECUTE_READWRITE, &mut old)?;
     ORIGINAL_ENDSCENE = orig;
     *slot = hook_addr;
-    let mut t: u32 = 0;
-    let _ = VirtualProtect(slot as *mut c_void, 4, old, &mut t);
-    crate::log(&format!(
-        "D3D EndScene hook installed (device=0x{:x})",
-        device as usize
-    ));
-    true
+    let mut t = std::mem::zeroed();
+    VirtualProtect(slot as *mut c_void, 4, old, &mut t).ok();
+
+    Ok(())
 }
 
 /// proxy 解析 hook：处理 `"Proxies"` 块（命中注册表则创建代理 + 注入参数 + bind），
@@ -663,7 +659,7 @@ unsafe extern "thiscall" fn proxy_parse_hook(this: *mut c_void, kv: *mut c_void)
     // 总是透传（我们的代理已摘除，可与内置代理共存）。
     // 加固：链式下一跳（trampoline 或先加载者 hook）无效时安全返回，避免调用坏指针。
     let orig_ptr = core::ptr::addr_of!(ORIGINAL_PROXY_PARSE).read();
-    if orig_ptr == 0 || !crate::kv::is_readable(orig_ptr as *const c_void) {
+    if orig_ptr == 0 || crate::kv::test_readable(orig_ptr as *const c_void).is_err() {
         return;
     }
     let orig: unsafe extern "thiscall" fn(*mut c_void, *mut c_void) = transmute(orig_ptr);

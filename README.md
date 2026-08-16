@@ -100,7 +100,7 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 插件输出 `l4n_material_proxy_plugin.log`（当前工作目录），同时在引擎控制台以 `[l4n-proxy]` 前缀输出。启动游戏进主菜单后，日志里应能看到代理注册、命中与生效记录：
 
 ```
-[l4n-proxy] registered proxies: ["l4nrp_color_ramp", ...]
+[l4n-proxy] registered proxies: ["does_equal", ...]
 [l4n-proxy] proxy parse hook installed ...
 [l4n-proxy] apply_proxies: MATCH 'is_in_range' material=0x..
 [l4n-proxy] is_in_range[vgui/common/l4d_spinner]: $src_var=0.5000 in [$min_var=0.0000,$max_var=1.0000] -> $result_var2=1

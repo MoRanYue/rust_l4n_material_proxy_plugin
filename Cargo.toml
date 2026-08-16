@@ -15,4 +15,7 @@ codegen-units = 1
 panic = "abort"
 
 [dependencies]
+anyhow = "1.0.104"
+thiserror = "2.0.20"
 uuid = { version = "1.24.0", features = ["v4"] }
+windows = { version = "0.62.2", features = ["Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory"] }

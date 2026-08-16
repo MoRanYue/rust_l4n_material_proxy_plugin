@@ -3,54 +3,46 @@
 
 use core::ffi::c_void;
 
+use windows::Win32::{Foundation::GetLastError, System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery}};
+
+use crate::error::PluginError;
+
 /// 材质代理统一接口。
-///
-/// - [`apply_kv`](Proxy::apply_kv)：VMT `"Proxies" { "代理名" { 键 值 } }` 里的每个键值对
-///   调用一次，由实现者按名填充自己的参数；
-/// - [`bind`](Proxy::bind)：代理触发时的动作（`material` 为 `IMaterial*`）。
-///   返回 `false` 表示材质失效/所需变量缺失，调用方应从活动表移除；
-/// - [`per_frame`](Proxy::per_frame)：是否每帧执行（默认 `false`，仅材质加载时执行一次）。
 pub trait Proxy: Send {
+    /// 对 VMT 中每个 `"Proxies" { "代理名" { "键" "值" } }` 键值对调用一次，由实现者按名填充自己的参数。
     fn apply_kv(&mut self, name: &str, value: &str);
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool;
+    /// 代理触发时的动作（`material` 为 `IMaterial*`）。返回 `Err(_)` 时调用方会将材质从活动表移除；
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError>;
+    /// 是否每帧执行，为 `false` 时仅材质加载时执行一次。
     fn per_frame(&self) -> bool {
         false
     }
 }
 
 // ---------- 内存可读性检查（防 strlen/CStr 读到坏指针崩溃） ----------
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn VirtualQuery(lp: *const c_void, lp_buffer: *mut c_void, dw_length: usize) -> usize;
-}
 
 /// 粗略检查指针指向的内存是否已提交且可读（防止 `strlen`/`CStr` 读到坏指针崩溃）。
-pub fn is_readable(p: *const c_void) -> bool {
+pub fn test_readable(p: *const c_void) -> Result<(), PluginError> {
     if p.is_null() {
-        return false;
+        return Err(PluginError::InvalidPointer);
     }
-    const MEM_COMMIT: u32 = 0x1000;
-    const PAGE_NOACCESS: u32 = 0x01;
-    const PAGE_GUARD: u32 = 0x100;
     unsafe {
-        // 32 位 MEMORY_BASIC_INFORMATION 布局（x86）
-        #[repr(C)]
-        struct Mbi32 {
-            base: *mut c_void,
-            allocation_base: *mut c_void,
-            allocation_protect: u32,
-            region_size: usize,
-            state: u32,
-            protect: u32,
-            type_: u32,
-        }
-        let mut mbi: Mbi32 = core::mem::zeroed();
-        let n = VirtualQuery(p, (&mut mbi as *mut Mbi32).cast(), core::mem::size_of::<Mbi32>());
+        let mut mbi = core::mem::zeroed();
+        let n = VirtualQuery(Some(p), &mut mbi, core::mem::size_of::<MEMORY_BASIC_INFORMATION>());
         if n == 0 {
-            return false;
+            return Err(PluginError::Windows(GetLastError().into()));
         }
-        (mbi.state & MEM_COMMIT) != 0
-            && (mbi.protect & PAGE_GUARD) == 0
-            && (mbi.protect & 0xff) != PAGE_NOACCESS
+        
+        if mbi.State != MEM_COMMIT {
+            return Err(PluginError::InaccesibleMemory);
+        }
+        if (mbi.Protect & PAGE_NOACCESS).0 != 0 || (mbi.Protect & PAGE_GUARD).0 != 0 {
+            return Err(PluginError::InaccesibleMemory);
+        }
+        if mbi.Protect.0 & 0xEE == 0 {
+            return Err(PluginError::InaccesibleMemory);
+        }
+
+        Ok(())
     }
 }

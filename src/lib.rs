@@ -11,11 +11,17 @@ mod expr;
 mod material;
 mod proxy;
 mod util;
+mod error;
 
+use windows::Win32::Foundation::GetLastError;
+use windows::core::{HSTRING, s};
+use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use core::ffi::{c_char, c_void, CStr};
 use std::ffi::CString;
 use std::sync::OnceLock;
 
+use error::PluginError;
 use proxy::*;
 
 // ---------------------------------------------------------------------------
@@ -38,28 +44,12 @@ struct L4NPlugin {
     vtable: &'static L4NPluginVtable,
 }
 
-// ---------------------------------------------------------------------------
-// 日志
-// ---------------------------------------------------------------------------
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn OutputDebugStringA(lp: *const c_char);
-    fn GetModuleHandleA(lp: *const u8) -> *mut c_void;
-    fn GetProcAddress(hmodule: *mut c_void, name: *const u8) -> *mut c_void;
-}
-
-fn engine_msg_ptr() -> Option<unsafe extern "C" fn(*const c_char, ...)> {
+fn engine_msg_ptr() -> Result<unsafe extern "C" fn(*const c_char, ...), PluginError> {
     unsafe {
-        let h = GetModuleHandleA(b"tier0.dll\0".as_ptr());
-        if h.is_null() {
-            return None;
-        }
-        let p = GetProcAddress(h, b"Msg\0".as_ptr());
-        if p.is_null() {
-            None
-        } else {
-            Some(core::mem::transmute(p))
-        }
+        let h = GetModuleHandleA(s!("tier0.dll"))?;
+        GetProcAddress(h, s!("Msg"))
+            .ok_or(PluginError::Windows(GetLastError().into()))
+            .map(|p| core::mem::transmute(p) )
     }
 }
 static ENGINE_MSG: OnceLock<Option<unsafe extern "C" fn(*const c_char, ...)>> = OnceLock::new();
@@ -75,14 +65,12 @@ fn log(msg: &str) {
         let _ = f.write_all(line.as_bytes());
         let _ = f.flush();
     }
-    if let Some(m) = *ENGINE_MSG.get_or_init(engine_msg_ptr) {
+    if let Some(m) = *ENGINE_MSG.get_or_init(|| engine_msg_ptr().ok()) {
         if let Ok(c) = CString::new(line.clone()) {
             unsafe { m(c.as_ptr()) };
         }
     }
-    if let Ok(c) = CString::new(line) {
-        unsafe { OutputDebugStringA(c.as_ptr()) };
-    }
+    unsafe { OutputDebugStringW(&HSTRING::from(line)); }
 }
 
 // ---------------------------------------------------------------------------
@@ -112,21 +100,15 @@ unsafe extern "thiscall" fn get_version(_this: *const L4NPlugin) -> *const c_cha
 }
 
 /// 尝试绑定 IMaterialSystem + 注册代理 + hook 引擎 proxy 解析函数（幂等）。
-unsafe fn try_bind_and_install() {
+unsafe fn try_bind_and_install() -> Result<(), PluginError> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static HOOKED: AtomicBool = AtomicBool::new(false);
     if HOOKED.load(Ordering::SeqCst) {
-        return;
+        return Ok(());
     }
 
     // 1. 绑定 IMaterialSystem
-    let _mat = match engine::bind_material_system() {
-        Some(m) => m,
-        None => {
-            log("materialsystem not loaded yet, will retry on D3D device created");
-            return;
-        }
-    };
+    let _mat = engine::bind_material_system()?;
 
     material::register_proxy::<DoesEqualProxy>("l4nrp_does_equal");
     material::register_proxy::<CompareProxy>("l4nrp_compare");
@@ -147,13 +129,11 @@ unsafe fn try_bind_and_install() {
     ));
 
     // 3. hook 引擎 proxy 解析函数 FUN_10002d50
-    let parse = engine::get_proxy_parse_addr();
-    if parse != 0 && material::install(parse) {
-        HOOKED.store(true, Ordering::SeqCst);
-        log("proxy parse hook installed (FUN_10002d50, direct var set)");
-    } else {
-        log("proxy parse hook install FAILED (materialsystem.dll not ready)");
-    }
+    let parse = engine::get_proxy_parse_addr()?;
+    material::install(parse)?;
+    HOOKED.store(true, Ordering::SeqCst);
+
+    Ok(())
 }
 
 unsafe extern "thiscall" fn on_module_loaded(
@@ -166,13 +146,16 @@ unsafe extern "thiscall" fn on_module_loaded(
         log(&format!("OnModuleLoaded: {name}"));
 
         if name == "client" {
-            try_bind_and_install();
+            match try_bind_and_install() {
+                Ok(_) => todo!(),
+                Err(_) => todo!(),
+            }
         }
     }
 }
 
 unsafe extern "thiscall" fn on_game_launch(_this: *mut L4NPlugin) {
-    log("Game launched");
+    log("OnGameLaunch");
 }
 
 unsafe extern "thiscall" fn on_d3d_created(_this: *mut L4NPlugin, d3d: *mut c_void) {
@@ -185,10 +168,16 @@ unsafe extern "thiscall" fn on_d3d_device_created(
     is_dxvk: u8,
 ) {
     log(&format!("OnD3DDeviceCreated device=0x{:x} is_dxvk={}", device as usize, is_dxvk != 0));
-    // D3D 首帧 fallback：若此前未绑定成功，再试一次
-    try_bind_and_install();
-    // 每帧执行持续计算的材质代理（EndScene hook）
-    material::install_d3d_endscene(device);
+    match material::install_d3d_endscene(device) {
+        Ok(()) => log(&format!(
+            "D3D EndScene hook installed (device=0x{:x})",
+            device as usize
+        )),
+        Err(e) => log(&format!(
+            "D3D EndScene hook error: {}",
+            e
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

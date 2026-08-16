@@ -1,6 +1,7 @@
 use core::ffi::c_void;
 use std::ffi::CString;
 
+use crate::error::{MaterialError, PluginError};
 use crate::kv::Proxy;
 use crate::{material, expr};
 use crate::util::{EPS, RelativeCompare};
@@ -54,23 +55,20 @@ impl Proxy for DoesEqualProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let a = material::get_float(material::find_var(material, &self.src_a_n));
-        let b = material::get_float(material::find_var(material, &self.src_b_n));
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
+        let a = material::get_float(material::find_var(material, &self.src_a_n)?)?;
+        let b = material::get_float(material::find_var(material, &self.src_b_n)?)?;
+        let out = material::find_var(material, &self.result_n)?;
+
         let v = if (a - b).abs() < EPS { 1 } else { 0 };
-        material::set_int(out, v);
+        material::set_int(out, v)?;
         #[cfg(debug_assertions)]
         {
             if v != self.last_result {
-                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
                 log(&format!(
                     "does_equal[{}]: {}={a:.4} {}={b:.4} -> {}={v}",
                     mat_name, self.src_a, self.src_b, self.result
@@ -78,7 +76,8 @@ impl Proxy for DoesEqualProxy {
                 self.last_result = v;
             }
         }
-        true
+
+        Ok(())
     }
 }
 
@@ -117,27 +116,23 @@ impl Proxy for CompareProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let a = material::get_float(material::find_var(material, &self.src_a_n));
-        let b = material::get_float(material::find_var(material, &self.src_b_n));
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
+        let a = material::get_float(material::find_var(material, &self.src_a_n)?)?;
+        let b = material::get_float(material::find_var(material, &self.src_b_n)?)?;
+        let out = material::find_var(material, &self.result_n)?;
         let v = match a.relative_cmp(&b) {
             std::cmp::Ordering::Less => -1,
             std::cmp::Ordering::Equal => 0,
             std::cmp::Ordering::Greater => 1
         };
-        material::set_int(out, v);
+        material::set_int(out, v)?;
         #[cfg(debug_assertions)]
         {
             if v != self.last_result {
-                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
                 log(&format!(
                     "compare[{}]: {}={a:.4} {}={b:.4} -> {}={v}",
                     mat_name, self.src_a, self.src_b, self.result
@@ -145,7 +140,7 @@ impl Proxy for CompareProxy {
                 self.last_result = v;
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -191,24 +186,20 @@ impl Proxy for IsInRangeProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let src = material::get_float(material::find_var(material, &self.src_n));
-        let min = material::get_float(material::find_var(material, &self.min_n));
-        let max = material::get_float(material::find_var(material, &self.max_n));
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
+        let src = material::get_float(material::find_var(material, &self.src_n)?)?;
+        let min = material::get_float(material::find_var(material, &self.min_n)?)?;
+        let max = material::get_float(material::find_var(material, &self.max_n)?)?;
+        let out = material::find_var(material, &self.result_n)?;
         let v = if src >= min && src <= max { 1 } else { 0 };
-        material::set_int(out, v);
+        material::set_int(out, v)?;
         #[cfg(debug_assertions)]
         {
             if v != self.last_result {
-                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
                 log(&format!(
                     "is_in_range[{}]: {}={src:.4} in [{}={min:.4},{}={max:.4}] -> {}={v}",
                     mat_name, self.src, self.min, self.max, self.result
@@ -216,7 +207,7 @@ impl Proxy for IsInRangeProxy {
                 self.last_result = v;
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -275,21 +266,17 @@ impl Proxy for PrintVariable {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let var = material::find_var(material, &self.var_n);
-        if var.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
-        let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+        let var = material::find_var(material, &self.var_n)?;
+        let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
         match self.var_type {
             // ---- 向量：get_vec 读三分量 ----
             VarType::Vector => {
                 let mut o = [f32::NEG_INFINITY; 3];
-                material::get_vec(var, &mut o);
+                material::get_vec(var, &mut o)?;
                 if (o[0] - self.last_vec3[0]).abs() > EPS ||
                     (o[1] - self.last_vec3[1]).abs() > EPS ||
                     (o[2] - self.last_vec3[2]).abs() > EPS {
@@ -302,7 +289,7 @@ impl Proxy for PrintVariable {
             }
             // ---- 整数：get_int 直接读整数值（vtable +0x68）----
             VarType::Int => {
-                let v = material::get_int(var);
+                let v = material::get_int(var)?;
                 if v != self.last_int {
                     log(&format!("print_variable[{}]: {}={v} (int)", mat_name, self.var));
                     self.last_int = v;
@@ -310,7 +297,7 @@ impl Proxy for PrintVariable {
             }
             // ---- 字符串：get_string 读字符串（vtable +0x18）----
             VarType::String => {
-                let s = material::get_string(var).unwrap_or_else(|| "<null>".into());
+                let s = material::get_string(var).unwrap_or_else(|_| "<null>".into());
                 if s != self.last_str {
                     log(&format!("print_variable[{}]: {}='{s}' (str)", mat_name, self.var));
                     self.last_str = s;
@@ -318,14 +305,14 @@ impl Proxy for PrintVariable {
             }
             // ---- 标量浮点 ----
             VarType::Float => {
-                let v = material::get_float(var);
+                let v = material::get_float(var)?;
                 if (v - self.last_float).abs() > EPS {
                     log(&format!("print_variable[{}]: {}={v:.4} (float)", mat_name, self.var));
                     self.last_float = v;
                 }
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -369,19 +356,15 @@ impl Proxy for StrSliceProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let s = material::get_string(material::find_var(material, &self.src_n)).unwrap_or_default();
+        let s = material::get_string(material::find_var(material, &self.src_n)?).unwrap_or_default();
         // src_start / src_len 为整型变量：起始位置 / 截取长度
-        let start = material::get_int(material::find_var(material, &self.src_start_n));
-        let len = material::get_int(material::find_var(material, &self.src_len_n));
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
+        let start = material::get_int(material::find_var(material, &self.src_start_n)?)?;
+        let len = material::get_int(material::find_var(material, &self.src_len_n)?)?;
+        let out = material::find_var(material, &self.result_n)?;
         // 按字符（而非字节）切片，避免 UTF-8 边界 panic；越界 clamp 到合法范围
         let chars: Vec<char> = s.chars().collect();
         let n = chars.len() as i32;
@@ -389,11 +372,11 @@ impl Proxy for StrSliceProxy {
         let len = len.clamp(0, n - start);
         let v: String = chars[start as usize..(start + len) as usize].iter().collect();
         let c = cstr_of(&v);
-        material::set_string(out, &c);
+        material::set_string(out, &c)?;
         #[cfg(debug_assertions)]
         {
             if self.last_result.to_bytes() != v.as_bytes() {
-                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
                 log(&format!(
                     "str_slice[{}]: {}='{s}' start={start} len={len} -> {}='{v}'",
                     mat_name, self.src, self.result
@@ -401,7 +384,7 @@ impl Proxy for StrSliceProxy {
                 self.last_result = cstr_of(&v);
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -428,17 +411,14 @@ impl Proxy for VmtName {
             _ => {}
         }
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            return false;
-        }
+        let out = material::find_var(material, &self.result_n)?;
         let name = material::get_name(material).unwrap_or_default();
         let c = cstr_of(&name);
-        material::set_string(out, &c);
+        material::set_string(out, &c)?;
         #[cfg(debug_assertions)]
         {
             if self.last_result.to_bytes() != name.as_bytes() {
@@ -449,7 +429,7 @@ impl Proxy for VmtName {
                 self.last_result = cstr_of(&name);
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -489,24 +469,20 @@ impl Proxy for StrConcatProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let a = material::get_string(material::find_var(material, &self.src_a_n)).unwrap_or_default();
-        let b = material::get_string(material::find_var(material, &self.src_b_n)).unwrap_or_default();
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
+        let a = material::get_string(material::find_var(material, &self.src_a_n)?).unwrap_or_default();
+        let b = material::get_string(material::find_var(material, &self.src_b_n)?).unwrap_or_default();
+        let out = material::find_var(material, &self.result_n)?;
         let v = format!("{a}{b}");
         let c = cstr_of(&v);
-        material::set_string(out, &c);
+        material::set_string(out, &c)?;
         #[cfg(debug_assertions)]
         {
             if self.last_result.to_bytes() != v.as_bytes() {
-                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
                 log(&format!(
                     "str_concat[{}]: {}='{a}' {}='{b}' -> {}='{v}'",
                     mat_name, self.src_a, self.src_b, self.result
@@ -514,7 +490,7 @@ impl Proxy for StrConcatProxy {
                 self.last_result = cstr_of(&v);
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -551,7 +527,10 @@ impl StrReplaceProxy {
     /// 参数值以 `$` 开头时当作变量名读取，否则当作字面字符串。
     unsafe fn read_str_or_var(&self, material: *mut c_void, val: &str, c: &CString) -> String {
         if val.starts_with('$') {
-            material::get_string(material::find_var(material, c)).unwrap_or_default()
+            material::find_var(material, c)
+                .ok()
+                .and_then(|v| material::get_string(v).ok())
+                .unwrap_or_default()
         } else {
             val.to_string()
         }
@@ -571,25 +550,21 @@ impl Proxy for StrReplaceProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let src = material::get_string(material::find_var(material, &self.src_n)).unwrap_or_default();
+        let src = material::get_string(material::find_var(material, &self.src_n)?).unwrap_or_default();
         let search = self.read_str_or_var(material, &self.search, &self.search_n);
         let replace = self.read_str_or_var(material, &self.replace, &self.replace_n);
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
+        let out = material::find_var(material, &self.result_n)?;
         let v = src.replace(&search, &replace);
         let c = cstr_of(&v);
-        material::set_string(out, &c);
+        material::set_string(out, &c)?;
         #[cfg(debug_assertions)]
         {
             if self.last_result.to_bytes() != v.as_bytes() {
-                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
                 log(&format!(
                     "str_replace[{}]: {}='{src}' '{}'->'{}' -> {}='{v}'",
                     mat_name, self.src, self.search, self.replace, self.result
@@ -597,7 +572,7 @@ impl Proxy for StrReplaceProxy {
                 self.last_result = cstr_of(&v);
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -641,26 +616,22 @@ impl Proxy for Vec3Proxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let x = material::get_float(material::find_var(material, &self.src_x_n));
-        let y = material::get_float(material::find_var(material, &self.src_y_n));
-        let z = material::get_float(material::find_var(material, &self.src_z_n));
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
+        let x = material::get_float(material::find_var(material, &self.src_x_n)?)?;
+        let y = material::get_float(material::find_var(material, &self.src_y_n)?)?;
+        let z = material::get_float(material::find_var(material, &self.src_z_n)?)?;
+        let out = material::find_var(material, &self.result_n)?;
         let o = [x, y, z];
-        material::set_vec(out, &o);
+        material::set_vec(out, &o)?;
         #[cfg(debug_assertions)]
         {
             if (o[0] - self.last_result[0]).abs() > EPS ||
                 (o[1] - self.last_result[1]).abs() > EPS ||
                 (o[2] - self.last_result[2]).abs() > EPS {
-                let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
                 log(&format!(
                     "vec3[{}]: {}={x:.4} {}={y:.4} {}={z:.4} -> {}={x:.4},{y:.4},{z:.4}",
                     mat_name, self.src_x, self.src_y, self.src_z, self.result
@@ -668,7 +639,7 @@ impl Proxy for Vec3Proxy {
                 self.last_result = o;
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -706,28 +677,27 @@ impl Proxy for MathProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
-        // 变量解析：表达式里的 `name` → 读材质 `$name` 变量
+        let out = material::find_var(material, &self.result_n)?;
+        // 变量解析：表达式里的 `name` → 读材质 `$name` 变量（未定义/读取失败按 0.0）
         let mut resolve = |name: &str| -> f32 {
             let full = format!("${name}");
             let c = cstr_of(&full);
-            unsafe { material::get_float(material::find_var(material, &c)) }
+            match unsafe { material::find_var(material, &c) } {
+                Ok(v) => unsafe { material::get_float(v) }.unwrap_or(0.0),
+                Err(_) => 0.0,
+            }
         };
         match expr::eval_math(&self.expr, &mut resolve) {
             Ok(v) => {
-                material::set_float(out, v);
+                material::set_float(out, v)?;
                 #[cfg(debug_assertions)]
                 {
                     if (v - self.last_result).abs() > EPS {
-                        let mat_name = material::get_name(material).unwrap_or_else(|| "?".into());
+                        let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
                         log(&format!(
                             "math[{}]: {}='{}' = {}",
                             mat_name, self.result, self.expr, v
@@ -740,7 +710,7 @@ impl Proxy for MathProxy {
                 log(&format!("math: expr '{}' error: {}", self.expr, e.0));
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -778,31 +748,30 @@ impl Proxy for LogicProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let out = material::find_var(material, &self.result_n);
-        if out.is_null() {
-            // 材质失效/变量缺失 → 从活动表移除
-            return false;
-        }
-        // 变量解析：表达式里的 `name` → 读材质 `$name` 变量
+        let out = material::find_var(material, &self.result_n)?;
+        // 变量解析：表达式里的 `name` → 读材质 `$name` 变量（未定义/读取失败按 0.0）
         let mut resolve = |name: &str| -> f32 {
             let full = format!("${name}");
             let c = cstr_of(&full);
-            unsafe { material::get_float(material::find_var(material, &c)) }
+            match unsafe { material::find_var(material, &c) } {
+                Ok(v) => unsafe { material::get_float(v) }.unwrap_or(0.0),
+                Err(_) => 0.0,
+            }
         };
         match expr::eval_logic(&self.expr, &mut resolve) {
             Ok(v) => {
                 let r = if v != 0.0 { 1 } else { 0 };
-                material::set_int(out, r);
+                material::set_int(out, r)?;
                 #[cfg(debug_assertions)]
                 {
                     if r != self.last_result {
                         log(&format!(
                             "logic[{}]: '{}' = {}",
-                            material::get_name(material).unwrap_or_else(|| "?".into()),
+                            material::get_name(material).unwrap_or_else(|_| "?".into()),
                             self.expr,
                             r
                         ));
@@ -814,7 +783,7 @@ impl Proxy for LogicProxy {
                 log(&format!("logic: expr '{}' error: {}", self.expr, e.0));
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -862,9 +831,8 @@ impl DelaySetProxy {
         }
         let c = cstr_of(h);
         unsafe {
-            let v = material::find_var(material, &self.handle_n);
-            if !v.is_null() {
-                material::set_string(v, &c);
+            if let Ok(v) = material::find_var(material, &self.handle_n) {
+                let _ = material::set_string(v, &c);
             }
         }
     }
@@ -894,20 +862,19 @@ impl Proxy for DelaySetProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let out = material::find_var(material, &self.output_n);
-        if out.is_null() {
+        if let Err(e) = material::find_var(material, &self.output_n) {
             // 材质失效/变量缺失 → 从活动表移除，并清理挂起的计时器（防泄漏/悬垂）
             if !self.current.is_empty() {
                 material::abort_timer(&self.current);
                 self.current.clear();
             }
-            return false;
+            return Err(e);
         }
-        let t = material::get_int(material::find_var(material, &self.trigger_n));
+        let t = material::get_int(material::find_var(material, &self.trigger_n)?)?;
 
         // 同步手柄状态：运行中写回手柄，否则写空字符串
         if !self.current.is_empty() {
@@ -940,7 +907,7 @@ impl Proxy for DelaySetProxy {
             }
         }
         self.last_trigger = t;
-        true
+        Ok(())
     }
 }
 
@@ -977,13 +944,13 @@ impl Proxy for DelayAbortProxy {
     fn per_frame(&self) -> bool {
         true
     }
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool {
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
         if material.is_null() {
-            return false;
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
-        let t = material::get_int(material::find_var(material, &self.trigger_n));
+        let t = material::get_int(material::find_var(material, &self.trigger_n)?)?;
         // handle 变量是字符串类型（UUID v4），用 get_string 读取
-        let h = material::get_string(material::find_var(material, &self.handle_n));
+        let h = material::get_string(material::find_var(material, &self.handle_n)?).ok();
         if t != 0 {
             if let Some(h) = h {
                 if !h.is_empty() && material::abort_timer(&h) {
@@ -994,6 +961,6 @@ impl Proxy for DelayAbortProxy {
                 }
             }
         }
-        true
+        Ok(())
     }
 }
