@@ -19,7 +19,7 @@ use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 use core::ffi::{c_char, c_void, CStr};
 use std::ffi::CString;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use error::PluginError;
 use proxy::*;
@@ -54,16 +54,29 @@ fn engine_msg_ptr() -> Result<unsafe extern "C" fn(*const c_char, ...), PluginEr
 }
 static ENGINE_MSG: OnceLock<Option<unsafe extern "C" fn(*const c_char, ...)>> = OnceLock::new();
 
+/// 全局日志文件句柄：首次写日志时以截断方式创建（清除上一次运行日志），之后复用句柄追加写入。
+struct LogSink {
+    file: std::fs::File,
+}
+
+static LOG_SINK: OnceLock<Mutex<Option<LogSink>>> = OnceLock::new();
+
 fn log(msg: &str) {
     use std::io::Write;
     let line = format!("[l4n-proxy] {msg}\n");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("l4n_material_proxy_plugin.log")
     {
-        let _ = f.write_all(line.as_bytes());
-        let _ = f.flush();
+        let sink = LOG_SINK.get_or_init(|| Mutex::new(None));
+        let mut guard = sink.lock().unwrap();
+        if guard.is_none() {
+            // 每次游戏运行（插件加载）首次写日志前，清空上一次运行留下的日志文件。
+            *guard = std::fs::File::create("l4n_material_proxy_plugin.log")
+                .ok()
+                .map(|file| LogSink { file });
+        }
+        if let Some(s) = guard.as_mut() {
+            let _ = s.file.write_all(line.as_bytes());
+            let _ = s.file.flush();
+        }
     }
     if let Some(m) = *ENGINE_MSG.get_or_init(|| engine_msg_ptr().ok()) {
         if let Ok(c) = CString::new(line.clone()) {

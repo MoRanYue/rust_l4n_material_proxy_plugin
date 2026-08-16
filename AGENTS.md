@@ -239,8 +239,8 @@ cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/e
 - 部署：复制 DLL 到游戏安装目录 `bin/neko/plugins`（必须与 `left4neko.dll` 同目录的 `neko/plugins`，
   **不是**工作区里的 `bin/neko/plugins`）。left4neko 用 `std::filesystem::directory_iterator` 遍历
   该目录所有 DLL 并调用 `GetL4NPluginInstance`。
-- 日志：`l4n_material_proxy_plugin.log`（当前工作目录）+ 引擎控制台 `[l4n-proxy]` 前缀输出
-  （tier0.dll `Msg`，fallback `OutputDebugStringA`）。
+- 日志：`l4n_material_proxy_plugin.log`（当前工作目录，**每次游戏运行（插件加载）首次写日志前
+  自动清空**）+ 引擎控制台 `[l4n-proxy]` 前缀输出（tier0.dll `Msg`，fallback `OutputDebugStringA`）。
 - 安装时序：`OnModuleLoaded("client")` 或 D3D 首帧（`on_d3d_device_created`）时调用
   `try_bind_and_install`（幂等，成功安装后不再重复）；必须先等 `materialsystem.dll` 加载。
 
