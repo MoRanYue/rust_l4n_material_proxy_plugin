@@ -316,7 +316,10 @@ pub fn run_active_proxies() {
     let mut stale: Vec<u64> = Vec::new();
     for (id, m, p) in items {
         if let Err(e) = unsafe { (&mut *p).bind(m) } {
-            crate::log(&e.to_string());
+            crate::log(&format!(
+                "material '{}' error: {}",
+                unsafe { get_name(m) }.unwrap_or("?".into()), e
+            ));
             stale.push(id);
         }
     }
@@ -498,7 +501,8 @@ unsafe fn apply_proxies(material: *mut c_void, kv: *mut c_void) -> bool {
                     let _ = proxy.bind(material);
                     register_active(material, proxy);
                     crate::log(&format!("apply_proxies: '{}' registered per-frame", name));
-                } else {
+                }
+                else {
                     // 一次性：仅材质加载时执行
                     let _ = proxy.bind(material);
                 }
@@ -511,11 +515,13 @@ unsafe fn apply_proxies(material: *mut c_void, kv: *mut c_void) -> bool {
             // 摘除当前节点：前驱.m_pPeer = 当前.m_pPeer；若为首子键则 proxies.m_pSub = 当前.m_pPeer
             if !prev.is_null() {
                 *(prev.add(0x1c) as *mut *mut c_void) = next;
-            } else {
+            }
+            else {
                 *(proxies.add(0x20) as *mut *mut c_void) = next;
             }
             *(cur.add(0x1c) as *mut *mut c_void) = core::ptr::null_mut(); // 防残留
-        } else {
+        }
+        else {
             prev = cur;
         }
         cur = next;

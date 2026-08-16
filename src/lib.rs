@@ -148,8 +148,8 @@ unsafe extern "thiscall" fn on_module_loaded(
 
         if name == "client" {
             match try_bind_and_install() {
-                Ok(_) => todo!(),
-                Err(_) => todo!(),
+                Ok(_) => log("Successfully installed hooks"),
+                Err(e) => log(&format!("Failed to install hooks: {}", e)),
             }
         }
     }
