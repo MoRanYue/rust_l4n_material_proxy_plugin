@@ -125,7 +125,7 @@ materialsystem.dll `FUN_10002d50`（RVA `0x2d50`）是引擎解析 VMT `"Proxies
   再逐个 `bind`。若持有锁期间 `bind` 经引擎回调（如创意工坊 Mod 刷新材质 → `apply_proxies` →
   `register_active`）再次对 `ACTIVE` 加锁，会造成 `std::sync::Mutex` 重入死锁（表现为"无响应"）。
 - **`ActiveProxy` 手动 `unsafe impl Send`**：`material` 指针仅在渲染线程内传递与使用（不跨线程拥有）。
-- **`bind` 返回 `false` = 材质失效/所需变量缺失** → 调用方从活动表移除该代理（防止悬垂 + 引擎
+- **`bind` 返回 `Err` = 材质失效/所需变量缺失** → 调用方从活动表移除该代理（防止悬垂 + 引擎
   `FindVar` 警告刷屏）。
 - **读指针前先 `is_readable` 检查**（`VirtualQuery`）：防止 `strlen`/`CStr` 读到坏指针崩溃。
   `is_readable` 复用 32 位 `MEMORY_BASIC_INFORMATION` 布局（`Mbi32`，x86）。
@@ -137,7 +137,7 @@ materialsystem.dll `FUN_10002d50`（RVA `0x2d50`）是引擎解析 VMT `"Proxies
 
 - 每个代理独立 struct（参数隔离），实现 [`Proxy`](src/kv.rs) trait：
   - `apply_kv(name, value)`：`"Proxies"` 块参数填充（参数名不区分大小写）
-  - `bind(material)`：读写材质 VMT 变量；返回 `false` 表示材质失效/变量缺失，从活动表移除
+  - `bind(material)`：读写材质 VMT 变量；返回 `Err` 表示材质失效/变量缺失，从活动表移除
   - `per_frame()`：是否每帧执行（依赖每帧变化的输入，如 `Sine` 输出，应覆写为 `true`）
 
 trait 定义（[`src/kv.rs`](src/kv.rs)）：
@@ -145,12 +145,12 @@ trait 定义（[`src/kv.rs`](src/kv.rs)）：
 ```rust
 pub trait Proxy: Send {
     fn apply_kv(&mut self, name: &str, value: &str);          // VMT "Proxies" 块参数填充
-    unsafe fn bind(&mut self, material: *mut c_void) -> bool; // 触发动作；返回 false = 材质失效/变量缺失
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError>; // 触发动作；返回 Err = 材质失效/变量缺失
     fn per_frame(&self) -> bool { false }                     // 是否每帧执行（持续计算）
 }
 ```
 
-> `bind` 返回 `false` 时，`run_active_proxies` 会从**活动表移除**该条目 —— 防止材质被引擎
+> `bind` 返回 `Err` 时，`run_active_proxies` 会从**活动表移除**该条目 —— 防止材质被引擎
 > 卸载/替换后活动表持有悬垂指针导致 "No such variable" 刷屏或崩溃。
 
 注册（泛型，见 [`src/lib.rs`](src/lib.rs) `try_bind_and_install`）：
@@ -166,6 +166,7 @@ material::register_proxy::<PrintVariable>("l4nrp_print_variable");
 material::register_proxy::<StrConcatProxy>("l4nrp_str_concat");
 material::register_proxy::<StrReplaceProxy>("l4nrp_str_replace");
 material::register_proxy::<StrSliceProxy>("l4nrp_str_slice");
+material::register_proxy::<StrLenProxy>("l4nrp_str_len");
 material::register_proxy::<VmtName>("l4nrp_vmt_name");
 material::register_proxy::<MathProxy>("l4nrp_math");
 material::register_proxy::<LogicProxy>("l4nrp_logic");
@@ -191,6 +192,9 @@ material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
 > panic）截取切片：`src_start`（整型，`get_int`，起始字符位置，越界 clamp 到 `[0, 长度]`）起，
 > `src_len`（整型，`get_int`，截取字符数，`<=0` 得空串，超出剩余则到末尾）→`result`
 > （`set_string`，每帧）。
+>
+> **`l4nrp_str_len` 字符串长度**：`src`（`get_string` 读）**按字符**（非字节）计数后写入
+> `result`（整型，`set_int`，每帧）。
 >
 > **`l4nrp_vmt_name` 材质名**：材质加载时把 `material::get_name(this)`（VMT 去掉 `.vmt` 后的路径，
 > 如 `"Example"`）写入 `result`（`set_string`，一次性，非 `per_frame`）。
@@ -221,9 +225,9 @@ material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
   （位于 [`src/lib.rs`](src/lib.rs)，可复用）。
 - 演示代理见 [`src/lib.rs`](src/lib.rs)：`ColorRampProxy` / `LogPulseProxy` / `ForceRedProxy` /
   `DoesEqualProxy` / `CompareProxy` / `IsInRangeProxy` / `PrintVariable` / `StrConcatProxy` /
-  `StrReplaceProxy` / `StrSliceProxy` / `VmtName` / `MathProxy` / `LogicProxy` / `Vec3Proxy` /
+  `StrReplaceProxy` / `StrSliceProxy` / `StrLenProxy` / `VmtName` / `MathProxy` / `LogicProxy` / `Vec3Proxy` /
   `DelaySetProxy` / `DelayAbortProxy`。
-- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 16 个代理及其参数）。
+- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 17 个代理及其参数）。
 
 ## 构建 / 部署 / 验证
 
@@ -253,8 +257,8 @@ cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/e
   释放 `ACTIVE` 锁**后才执行 `bind`（避免持锁期间 `bind` 内部重新入锁导致 Mutex 重入死锁 ——
   表现为游戏无响应）。材质被引擎销毁后活动表条目可能**悬垂**（暂未做清理）；若切换地图/重载材质
   后崩溃，请将该材质改用一次性代理，或后续增加材质析构回调清理活动表。
-- v5.3：`Proxy::bind` 返回 `bool`；材质被引擎卸载/替换（活动表持有悬垂指针）或所需输出变量缺失时
-  返回 `false`，`run_active_proxies` 会从活动表**移除失效条目**，避免 "No such variable" 刷屏 /
+- v5.3：`Proxy::bind` 返回 `Result`；材质被引擎卸载/替换（活动表持有悬垂指针）或所需输出变量缺失时
+  返回 `Err`，`run_active_proxies` 会从活动表**移除失效条目**，避免 "No such variable" 刷屏 /
   崩溃。
 - v5.4：`register_active` **不能按材质去重**。曾按 `material` 去重（同一材质已有则替换），导致同一
   材质上注册多个 per-frame 代理时只有最后一个生效（如 `l4nrp_print_variable` 被

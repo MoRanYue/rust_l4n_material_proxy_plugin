@@ -61,6 +61,10 @@
     // l4nrp_vmt_name 的输出变量（字符串，材质加载时写入材质文件名，如 "Example"）
     "$mat_name" ""
 
+    // l4nrp_str_len 的输入 / 输出变量（字符串 + 整型长度）
+    "$str_len"        "hello world"
+    "$str_len_result" "0"
+
     "Proxies"
     {
         // 4) l4nrp_does_equal —— 每帧比较 $src_var_1 与 $src_var_2，
@@ -178,6 +182,13 @@
         "l4nrp_vmt_name"
         {
             "result" "$mat_name"
+        }
+
+        // 16) l4nrp_str_len —— 每帧计算 $str_len 的字符长度（按字符，非字节）→ $str_len_result
+        "l4nrp_str_len"
+        {
+            "src"    "$str_len"
+            "result" "$str_len_result"
         }
     }
 }

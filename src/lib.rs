@@ -117,6 +117,7 @@ unsafe fn try_bind_and_install() -> Result<(), PluginError> {
     material::register_proxy::<StrConcatProxy>("l4nrp_str_concat");
     material::register_proxy::<StrReplaceProxy>("l4nrp_str_replace");
     material::register_proxy::<StrSliceProxy>("l4nrp_str_slice");
+    material::register_proxy::<StrLenProxy>("l4nrp_str_len");
     material::register_proxy::<VmtName>("l4nrp_vmt_name");
     material::register_proxy::<Vec3Proxy>("l4nrp_vec3");
     material::register_proxy::<MathProxy>("l4nrp_math");

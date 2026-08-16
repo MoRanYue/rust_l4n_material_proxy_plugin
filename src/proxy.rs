@@ -388,6 +388,61 @@ impl Proxy for StrSliceProxy {
     }
 }
 
+/// l4nrp_str_len —— 读取 `src` 字符串变量，计算其字符长度（按字符，非字节）并写入 `result`（整型）。
+pub struct StrLenProxy {
+    src: String,
+    result: String,
+    last_result: i32,
+    src_n: CString,
+    result_n: CString,
+}
+impl Default for StrLenProxy {
+    fn default() -> Self {
+        Self {
+            src: "$src_var".into(),
+            result: "$result_var".into(),
+            last_result: -1,
+            src_n: cstr_of("$src_var"),
+            result_n: cstr_of("$result_var"),
+        }
+    }
+}
+impl Proxy for StrLenProxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "src" | "src_var" | "input" | "source" => set_kv(&mut self.src, &mut self.src_n, value),
+            "result" | "result_var" | "output" => set_kv(&mut self.result, &mut self.result_n, value),
+            _ => {}
+        }
+    }
+    // 依赖每帧变化的输入，需要每帧重算
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
+        if material.is_null() {
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
+        }
+        let s = material::get_string(material::find_var(material, &self.src_n)?).unwrap_or_default();
+        let out = material::find_var(material, &self.result_n)?;
+        // 按字符（而非字节）计数，避免 UTF-8 边界问题
+        let len = s.chars().count() as i32;
+        material::set_int(out, len)?;
+        #[cfg(debug_assertions)]
+        {
+            if len != self.last_result {
+                let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
+                log(&format!(
+                    "str_len[{}]: {}='{s}' -> {}={len}",
+                    mat_name, self.src, self.result
+                ));
+                self.last_result = len;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// l4nrp_vmt_name —— 把材质自身文件名（`material::get_name`，即 VMT 去掉 `.vmt` 后的路径）
 /// 写入 `result` 变量（字符串类型）。材质名不会变化，仅材质加载时执行一次。
 pub struct VmtName {
