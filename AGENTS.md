@@ -212,9 +212,14 @@ material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
 >
 > **`l4nrp_delay_set` 延迟置位**：检测 `trigger`（整型，`get_int`）非 0 的**上升沿**后，向全局
 > 计时器注册表（[`material.rs`](src/material.rs) `start_timer`）申请一个 **UUID v4 字符串手柄**
-> （`uuid` crate `Uuid::new_v4()`）并计时 `delay` 毫秒，到期由 `run_timers` 每帧把 `value` 变量的
-> 整型值（`get_int`）复制到 `output`（`set_int`）；可选 `handle` 变量写出当前手柄（字符串类型，
-> 无计时器写空字符串），供 `l4nrp_delay_abort` 等代理中断。上升沿触发（需先回 0 再置位才重复触发）。
+> （`uuid` crate `Uuid::new_v4()`）并计时 `delay` 毫秒；`value` 变量（整型，`get_int`）在**触发（上升沿）
+> 那一刻读取并快照**，到期由 `run_timers` 每帧用 `set_int` 把该**快照值**写入 `output`（延迟期间源变量
+> 再变不影响本次输出）。可选 `handle` 变量写出当前手柄（字符串类型，无计时器写空字符串），供
+> `l4nrp_delay_abort` 等代理中断。上升沿触发（需先回 0 再置位才重复触发）。
+>
+> 生命周期：计时器为全局注册表条目，与代理实例解耦。`DelaySetProxy` 实现了 `Drop` —— 代理离开活动表/
+> 被销毁时（`bind` 返回 `Err` 被移除、材质失效、插件卸载）统一调用 `abort_current` 取消挂起的计时器，
+> 防止其在全局 `TIMERS` 表残留、到期访问已失效材质。
 >
 > **`l4nrp_delay_abort` 中断计时器**：`trigger`（整型，`get_int`）非 0 时，读取 `handle` 变量
 > （字符串类型，`get_string`）指定的 UUID 手柄并调用 `material::abort_timer` 中断对应计时器

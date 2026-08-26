@@ -333,24 +333,27 @@ pub fn run_active_proxies() {
 struct ActiveTimer {
     handle: String, // UUID v4 字符串手柄
     material: *mut c_void,
-    output_n: CString, // 到期后把 value 变量整型值写入此变量
-    value_n: CString,  // 值来源变量名
+    output_n: CString, // 到期后把 value 写入此变量
+    value: i32,        // 触发时快照的整型值（语义：到期写入的是触发时刻的值）
     end: Instant,
 }
 // material 指针仅在渲染线程内使用，手动标记 Send 以放入 Mutex
 unsafe impl Send for ActiveTimer {}
 static TIMERS: Mutex<Vec<ActiveTimer>> = Mutex::new(Vec::new());
 
-/// 启动一个计时器：`delay_ms` 后（由 `run_timers` 每帧触发）把 `value` 变量整型值写入
-/// `output`。返回 **UUID v4 字符串手柄**，供中断/查询。
-pub fn start_timer(material: *mut c_void, output_n: CString, value_n: CString, delay_ms: u64) -> String {
+/// 启动一个计时器：`delay_ms` 后（由 `run_timers` 每帧触发）把 `value`（触发时快照的**整型值**）
+/// 写入 `output`。返回 **UUID v4 字符串手柄**，供中断/查询。
+///
+/// 语义说明：`value` 在**启动（触发）时**由调用方读取并快照，到期写入的是那一刻的值；
+/// 延迟期间源变量再变化不影响本次输出。
+pub fn start_timer(material: *mut c_void, output_n: CString, value: i32, delay_ms: u64) -> String {
     let h = Uuid::new_v4().to_string();
     let mut ts = TIMERS.lock().unwrap();
     ts.push(ActiveTimer {
         handle: h.clone(),
         material,
         output_n,
-        value_n,
+        value,
         end: Instant::now() + std::time::Duration::from_millis(delay_ms),
     });
     h
@@ -369,7 +372,7 @@ pub fn timer_active(handle: &str) -> bool {
     TIMERS.lock().unwrap().iter().any(|t| t.handle == handle)
 }
 
-/// 每帧触发到期的计时器：把 `value` 变量整型值写入 `output` 并移除。
+/// 每帧触发到期的计时器：把触发时快照的整型值 `value` 写入 `output` 并移除。
 /// 先取出到期项再释放锁执行，避免持锁调用引擎（见 AGENTS.md 锁注意事项）。
 fn run_timers() {
     let mut fired: Vec<ActiveTimer> = Vec::new();
@@ -380,7 +383,8 @@ fn run_timers() {
         while i < ts.len() {
             if now >= ts[i].end {
                 fired.push(ts.remove(i));
-            } else {
+            }
+            else {
                 i += 1;
             }
         }
@@ -392,14 +396,8 @@ fn run_timers() {
         }
         unsafe {
             match find_var(t.material, &t.output_n) {
-                Ok(out) => match find_var(t.material, &t.value_n) {
-                    Ok(value_var) => match get_int(value_var) {
-                        Ok(v) => match set_int(out, v) {
-                            Ok(()) => (),
-                            Err(e) => crate::log(&e.to_string()),
-                        },
-                        Err(e) => crate::log(&e.to_string()),
-                    },
+                Ok(out) => match set_int(out, t.value) {
+                    Ok(()) => (),
                     Err(e) => crate::log(&e.to_string()),
                 },
                 Err(e) => crate::log(&e.to_string()),

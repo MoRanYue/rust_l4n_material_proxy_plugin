@@ -843,16 +843,17 @@ impl Proxy for LogicProxy {
 }
 
 /// l4nrp_delay_set —— 检测 `trigger` 变量（整型）非 0 的**上升沿**后，启动一个计时器，
-/// 延迟 `delay` 毫秒后把 `value` 变量（整型）的值复制到 `output`；`handle`（可选）写出本次
+/// 延迟 `delay` 毫秒后把 `value` 变量（整型）的**触发时快照值**写入 `output`；`handle`（可选）写出本次
 /// 计时器的 **UUID v4 字符串手柄**（无计时器时写空字符串），供其它代理（如 `l4nrp_delay_abort`）中断。
 ///
 /// 计时器由 [`material.rs`](material.rs) 的全局注册表托管：到期由 `run_timers` 每帧触发
-/// （先取出再释放锁，见 AGENTS.md）。`trigger` 未先回到 0 再置位前不会重复触发。
+/// （先取出再释放锁，见 AGENTS.md）。`value` 在**触发（上升沿）那一刻**被读取并快照，延迟期间源
+/// 变量变化不影响本次输出。`trigger` 未先回到 0 再置位前不会重复触发。
 pub struct DelaySetProxy {
     trigger: String,
     delay_ms: u64,
     output: String,
-    value: String, // 变量名：到期后读取其整型值并写入 output
+    value: String, // 变量名：触发时读取其整型值作为快照
     handle: String, // 可选；空 = 不写手柄变量
     last_trigger: i32,
     current: String, // 当前计时器 UUID 手柄；空 = 无
@@ -891,6 +892,22 @@ impl DelaySetProxy {
             }
         }
     }
+
+    /// 统一清理挂起的计时器（任何失败路径 / 被销毁时都会走这里，防止全局注册表残留）。
+    /// 注意：清理时不访问材质（可能在销毁路径上已失效/悬垂），只操作自己的手柄。
+    fn abort_current(&mut self) {
+        if !self.current.is_empty() {
+            material::abort_timer(&self.current);
+            self.current.clear();
+        }
+    }
+}
+impl Drop for DelaySetProxy {
+    fn drop(&mut self) {
+        // 代理离开活动表/被销毁（bind 返回 Err 被移除、材质失效、插件卸载）时，
+        // 确保取消挂起的计时器，防止其在全局 TIMERS 表里残留到期写坏内存。
+        self.abort_current();
+    }
 }
 impl Proxy for DelaySetProxy {
     fn apply_kv(&mut self, name: &str, value: &str) {
@@ -922,11 +939,8 @@ impl Proxy for DelaySetProxy {
             return Err(PluginError::Material(MaterialError::InvalidMaterial));
         }
         if let Err(e) = material::find_var(material, &self.output_n) {
-            // 材质失效/变量缺失 → 从活动表移除，并清理挂起的计时器（防泄漏/悬垂）
-            if !self.current.is_empty() {
-                material::abort_timer(&self.current);
-                self.current.clear();
-            }
+            // 材质失效/变量缺失 → 从活动表移除，并清理挂起的计时器（统一走 abort_current）
+            self.abort_current();
             return Err(e);
         }
         let t = material::get_int(material::find_var(material, &self.trigger_n)?)?;
@@ -944,20 +958,17 @@ impl Proxy for DelaySetProxy {
             self.write_handle(material, "");
         }
 
-        // 上升沿启动新计时器（注册表托管，返回 UUID 手柄）
+        // 上升沿启动新计时器：触发时刻读取 value 变量作为**快照**写入计时器，
+        // 到期后 run_timers 直接写快照（延迟期间 value 再变不影响本次输出）。
         if t != 0 && self.last_trigger == 0 && self.current.is_empty() {
-            self.current = material::start_timer(
-                material,
-                self.output_n.clone(),
-                self.value_n.clone(),
-                self.delay_ms,
-            );
+            let v = material::get_int(material::find_var(material, &self.value_n)?)?;
+            self.current = material::start_timer(material, self.output_n.clone(), v, self.delay_ms);
             self.write_handle(material, &self.current);
             #[cfg(debug_assertions)]
             {
                 log(&format!(
-                    "delay_set: timer {} started ({}ms), trigger={}",
-                    self.current, self.delay_ms, t
+                    "delay_set: timer {} started ({}ms), value={}, trigger={}",
+                    self.current, self.delay_ms, v, t
                 ));
             }
         }
