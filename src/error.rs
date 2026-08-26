@@ -24,8 +24,8 @@ pub enum MaterialError {
     InvalidMaterial,
     #[error("unexpected instance")]
     UnexpectedInstance,
-    #[error("variable '{0}' is not found in material '{1}'")]
-    VariableNotFound(Box<str>, Box<str>),
+    #[error("variable '{0}' is not found")]
+    VariableNotFound(Box<str>),
     #[error("vector access out of bound, reading {0} but its length is {1}")]
     VectorAccessOutOfBound(usize, usize)
 }
