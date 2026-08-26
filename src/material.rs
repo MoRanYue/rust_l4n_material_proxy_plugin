@@ -4,9 +4,11 @@
 
 use core::ffi::{c_char, c_void, CStr};
 use core::mem::transmute;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use uuid::Uuid;
@@ -61,8 +63,7 @@ pub unsafe fn find_var(mat: *mut c_void, name: &CStr) -> Result<*mut c_void, Plu
     }
     else {
         Err(PluginError::Material(MaterialError::VariableNotFound(
-            Box::from(name.to_string_lossy().into_owned()),
-            Box::from(get_name(mat).unwrap_or(format!("0x{:x}", mat as usize)))
+            Box::from(name.to_string_lossy().into_owned())
         )))
     }
 }
@@ -331,7 +332,7 @@ pub fn run_active_proxies() {
 
 // ---------- 计时器注册表（l4nrp_delay_set 生成 / l4nrp_delay_abort 中断） ----------
 struct ActiveTimer {
-    handle: String, // UUID v4 字符串手柄
+    // 注：handle 不存于此（作为 HashMap 的 key，见 TIMERS）
     material: *mut c_void,
     output_n: CString, // 到期后把 value 写入此变量
     value: i32,        // 触发时快照的整型值（语义：到期写入的是触发时刻的值）
@@ -339,7 +340,10 @@ struct ActiveTimer {
 }
 // material 指针仅在渲染线程内使用，手动标记 Send 以放入 Mutex
 unsafe impl Send for ActiveTimer {}
-static TIMERS: Mutex<Vec<ActiveTimer>> = Mutex::new(Vec::new());
+/// 计时器注册表：key = UUID v4 **字符串**手柄（生成时 `to_string` 一次，之后 `abort`/查询
+/// 直接按字符串匹配，无需再解析）。`LazyLock` 作懒初始化（`HashMap::new` 非常量可构造）。
+static TIMERS: LazyLock<Mutex<HashMap<String, ActiveTimer>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 启动一个计时器：`delay_ms` 后（由 `run_timers` 每帧触发）把 `value`（触发时快照的**整型值**）
 /// 写入 `output`。返回 **UUID v4 字符串手柄**，供中断/查询。
@@ -349,8 +353,7 @@ static TIMERS: Mutex<Vec<ActiveTimer>> = Mutex::new(Vec::new());
 pub fn start_timer(material: *mut c_void, output_n: CString, value: i32, delay_ms: u64) -> String {
     let h = Uuid::new_v4().to_string();
     let mut ts = TIMERS.lock().unwrap();
-    ts.push(ActiveTimer {
-        handle: h.clone(),
+    ts.insert(h.clone(), ActiveTimer {
         material,
         output_n,
         value,
@@ -359,36 +362,26 @@ pub fn start_timer(material: *mut c_void, output_n: CString, value: i32, delay_m
     h
 }
 
-/// 按手柄（UUID 字符串）中断计时器。返回是否找到并移除。
+/// 按手柄（UUID v4 字符串）中断计时器。返回是否找到并移除。
 pub fn abort_timer(handle: &str) -> bool {
-    let mut ts = TIMERS.lock().unwrap();
-    let before = ts.len();
-    ts.retain(|t| t.handle != handle);
-    ts.len() != before
+    TIMERS.lock().unwrap().remove(handle).is_some()
 }
 
 /// 指定手柄的计时器是否仍在运行。
 pub fn timer_active(handle: &str) -> bool {
-    TIMERS.lock().unwrap().iter().any(|t| t.handle == handle)
+    TIMERS.lock().unwrap().contains_key(handle)
 }
 
 /// 每帧触发到期的计时器：把触发时快照的整型值 `value` 写入 `output` 并移除。
 /// 先取出到期项再释放锁执行，避免持锁调用引擎（见 AGENTS.md 锁注意事项）。
 fn run_timers() {
-    let mut fired: Vec<ActiveTimer> = Vec::new();
-    {
-        let now = Instant::now();
-        let mut ts = TIMERS.lock().unwrap();
-        let mut i = 0;
-        while i < ts.len() {
-            if now >= ts[i].end {
-                fired.push(ts.remove(i));
-            }
-            else {
-                i += 1;
-            }
-        }
-    }
+    // extract_if：持锁消费掉到期条目，key/value 所有权移出（零复制），
+    // 无 Key 克隆、无中间集合分配。语句结束即释放锁，随后在锁外执行引擎写入。
+    let now = Instant::now();
+    let fired: Vec<ActiveTimer> = TIMERS.lock().unwrap()
+        .extract_if(|_, t| now >= t.end)
+        .map(|(_, t)| t)
+        .collect();
     for t in fired {
         // 防悬垂：材质已不可读（被引擎卸载/替换）则丢弃该计时器，避免解引用坏指针崩溃
         if crate::kv::test_readable(t.material as *const c_void).is_err() {
