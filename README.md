@@ -84,9 +84,13 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 | `l4nrp_is_in_range` | `src`→`$src_var`、`min`→`$min_var`、`max`→`$max_var`、`result`→`$result_var` | 在 [min,max] 内写 result=1 否则 0（每帧） |
 | `l4nrp_str_concat` | `src_a`→`$src_var_1`、`src_b`→`$src_var_2`、`result`→`$result_var` | 拼接两个字符串变量：src_a+src_b → result（每帧） |
 | `l4nrp_str_replace` | `src`→`$src_var`、`search`→""、`replace`→""、`result`→`$result_var` | 把 src 中所有 search 替换为 replace 写入 result（search/replace 以 `$` 开头当作变量名，否则字面量；每帧） |
+| `l4nrp_str_slice` | `src`→`$src_var`、`src_start`→`$src_start`、`src_len`→`$src_len`、`result`→`$result_var` | 从 src 字符串按**字符**（非字节，避免 UTF-8 边界 panic）切片：src_start 为起始字符位置（越界 clamp 到 `[0, 长度]`），src_len 为截取字符数（`<=0` 得空串，超出剩余则到末尾），结果写 result（每帧） |
+| `l4nrp_str_len` | `src`→`$src_var`、`result`→`$result_var` | 计算 src 字符串的**字符**长度（非字节计数）并写入 result（整型，每帧） |
+| `l4nrp_vmt_name` | `result`→`$result_var` | 把材质自身文件名（`material::get_name`，即 VMT 去掉 `.vmt` 后的路径，如 `"Example"`）写入 result（字符串，一次性，非每帧） |
+| `l4nrp_vec3` | `src_x`→`$src_x`、`src_y`→`$src_y`、`src_z`→`$src_z`、`result`→`$result_var` | 把 3 个浮点变量作为分量组成三维向量写入 result（每帧） |
 | `l4nrp_math` | `expr`→`"0"`、`result`→`$result_var` | 计算数学表达式（四则/幂/括号/函数；`$var` 或 `var` 读材质已定义变量），结果写入 result（每帧） |
 | `l4nrp_logic` | `expr`→`"0"`、`result`→`$result_var` | 计算逻辑表达式（比较 `== != < <= > >=` 与逻辑 `&& \|\| !`，非 0 视为真；另有 `in_range`/`in_range_exclusively` 范围函数），结果写 result（整型 0/1，每帧） |
-| `l4nrp_delay_set` | `trigger`→`$trigger_var`、`delay`→`1000`、`output`→`$result_var`、`value`→`$value_var`、`handle`→""（可选） | 检测 trigger（整型）非 0 上升沿后启动计时器，延迟 delay 毫秒把 value 变量的整型值复制到 output；handle 写出 UUID v4 计时器手柄（字符串类型，无计时器写空字符串，每帧） |
+| `l4nrp_delay_set` | `trigger`→`$trigger_var`、`delay`→`1000`、`output`→`$result_var`、`value`→`$value_var`、`handle`→""（可选） | 检测 trigger（整型）非 0 上升沿后启动计时器，延迟 delay 毫秒把 value 变量的整型值**触发时快照**写入 output（延迟期间 value 变化不影响本次输出）；handle 写出 UUID v4 计时器手柄（字符串类型，无计时器写空字符串，每帧） |
 | `l4nrp_delay_abort` | `trigger`→`$trigger_var`、`handle`→`$timer_handle` | trigger 非 0 时中断 handle 变量指定的计时器（每帧） |
 | `l4nrp_print_variable` | `var`→`$var`、`type`→`float`（`float`/`int`/`vector`/`string`） | 每帧读取变量并打印 |
 

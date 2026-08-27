@@ -18,7 +18,7 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 
 | 文件 | 职责 |
 |---|---|
-| [`src/lib.rs`](src/lib.rs) | 插件入口：IL4NPlugin 虚表/实现、演示代理定义、注册与 hook 安装时序 |
+| [`src/lib.rs`](src/lib.rs) | 插件入口：IL4NPlugin 虚表/实现、注册与 hook 安装时序 |
 | [`src/engine.rs`](src/engine.rs) | IMaterialSystem 绑定 + `FUN_10002d50`（proxy 解析函数）地址获取 |
 | [`src/kv.rs`](src/kv.rs) | `Proxy` trait 定义 + 内存可读性检查（`is_readable`） |
 | [`src/material.rs`](src/material.rs) | 代理注册表、KeyValues 解析、detour hook、D3D EndScene 每帧执行 |
@@ -156,9 +156,6 @@ pub trait Proxy: Send {
 注册（泛型，见 [`src/lib.rs`](src/lib.rs) `try_bind_and_install`）：
 
 ```rust
-material::register_proxy::<ColorRampProxy>("l4nrp_color_ramp");
-material::register_proxy::<LogPulseProxy>("l4nrp_log_pulse");
-material::register_proxy::<ForceRedProxy>("l4nrp_force_red");
 material::register_proxy::<DoesEqualProxy>("l4nrp_does_equal");
 material::register_proxy::<CompareProxy>("l4nrp_compare");
 material::register_proxy::<IsInRangeProxy>("l4nrp_is_in_range");
@@ -175,10 +172,6 @@ material::register_proxy::<DelaySetProxy>("l4nrp_delay_set");
 material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
 ```
 
-> 注意：`l4nrp_color_ramp` / `l4nrp_log_pulse` / `l4nrp_force_red` 三个演示代理目前仅在
-> `#[cfg(debug_assertions)]`（debug 构建）下注册，release 构建不包含（见 [`src/lib.rs`](src/lib.rs)
-> `try_bind_and_install`）。
->
 > **整数结果用 `SetInt`**：比较类代理（`does_equal` / `compare` / `is_in_range`）输出 0/1（`compare`
 > 为 -1/0/1）的结果变量用 `material::set_int` 写入（输入比较仍用 `get_float`）；`PrintVariable`
 > 用 `get_int` / `get_string` 读取 int / string 类型变量。
@@ -228,11 +221,10 @@ material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
 - **CString 缓存**：`per_frame` 代理在 struct 里缓存变量名 `CString`（`cstr_of` 构造），避免每帧
   反复堆分配；`apply_kv` 更新变量名时用辅助函数 `set_kv(&mut dst, &mut c, value)` 同步重建缓存
   （位于 [`src/lib.rs`](src/lib.rs)，可复用）。
-- 演示代理见 [`src/lib.rs`](src/lib.rs)：`ColorRampProxy` / `LogPulseProxy` / `ForceRedProxy` /
-  `DoesEqualProxy` / `CompareProxy` / `IsInRangeProxy` / `PrintVariable` / `StrConcatProxy` /
-  `StrReplaceProxy` / `StrSliceProxy` / `StrLenProxy` / `VmtName` / `MathProxy` / `LogicProxy` / `Vec3Proxy` /
-  `DelaySetProxy` / `DelayAbortProxy`。
-- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 17 个代理及其参数）。
+- 代理见 [`src/lib.rs`](src/lib.rs)：`DoesEqualProxy` / `CompareProxy` / `IsInRangeProxy` /
+  `PrintVariable` / `StrConcatProxy` / `StrReplaceProxy` / `StrSliceProxy` / `StrLenProxy` / `VmtName` /
+  `MathProxy` / `LogicProxy` / `Vec3Proxy` / `DelaySetProxy` / `DelayAbortProxy`。
+- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 14 个代理及其参数）。
 
 ## 构建 / 部署 / 验证
 
