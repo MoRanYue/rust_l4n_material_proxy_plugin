@@ -1,9 +1,13 @@
-//! L4N 示例插件：注册自定义材质代理（material proxy）。
+﻿//! L4N 示例插件：注册自定义材质代理（material proxy）。
 //!
 //! VMT `"Proxies"` 块里写代理名即可触发 Rust 回调读写材质 VMT 变量。
 //! 机制 / 逆向依据 / 注意事项见项目根目录 AGENTS.md。
 
 #![allow(unsafe_op_in_unsafe_fn)]
+// 禁止 `&T as *const T` / `&mut T as *mut T`：裸指针创建统一走 `&raw const` / `&raw mut`
+// （见 AGENTS.md「裸指针创建约定」）。`with_exposed_provenance` 是仅有的例外，用于没有
+// `&raw` 来源的外部地址（模块基址 + RVA、函数指针转 usize）。
+#![warn(clippy::ref_as_ptr)]
 
 pub mod engine;
 mod kv;
@@ -173,7 +177,7 @@ unsafe extern "thiscall" fn on_game_launch(_this: *mut L4NPlugin) {
 }
 
 unsafe extern "thiscall" fn on_d3d_created(_this: *mut L4NPlugin, d3d: *mut c_void) {
-    log(&format!("OnD3DCreated d3d=0x{:x}", d3d as usize));
+    log(&format!("OnD3DCreated d3d=0x{:x}", d3d.addr()));
 }
 
 unsafe extern "thiscall" fn on_d3d_device_created(
@@ -181,11 +185,11 @@ unsafe extern "thiscall" fn on_d3d_device_created(
     device: *mut c_void,
     is_dxvk: u8,
 ) {
-    log(&format!("OnD3DDeviceCreated device=0x{:x} is_dxvk={}", device as usize, is_dxvk != 0));
+    log(&format!("OnD3DDeviceCreated device=0x{:x} is_dxvk={}", device.addr(), is_dxvk != 0));
     match material::install_d3d_endscene(device) {
         Ok(()) => log(&format!(
             "D3D EndScene hook installed (device=0x{:x})",
-            device as usize
+            device.addr()
         )),
         Err(e) => log(&format!(
             "D3D EndScene hook error: {}",
@@ -213,7 +217,8 @@ static INSTANCE: OnceLock<L4NPlugin> = OnceLock::new();
 #[allow(private_interfaces)]
 #[unsafe(export_name = "GetL4NPluginInstance")]
 pub extern "C" fn l4n_plugin_instance() -> *mut L4NPlugin {
-    let inst = INSTANCE.get_or_init(|| L4NPlugin { vtable: &VTABLE });
-    let p: *const L4NPlugin = inst;
-    p as *mut L4NPlugin
+    // 这里拿到的是共享引用 `&L4NPlugin`（`INSTANCE` 为 `static`，`get_or_init` 只给 `&T`），
+    // 无法用 `&raw mut` 取裸指针，只能先 `&raw const` 再 cast 成 `*mut` 交给 left4neko。
+    let inst: *const L4NPlugin = &raw const *INSTANCE.get_or_init(|| L4NPlugin { vtable: &VTABLE });
+    inst.cast_mut()
 }

@@ -22,6 +22,8 @@ pub trait Proxy: Send {
 // ---------- 内存可读性检查（防 strlen/CStr 读到坏指针崩溃） ----------
 
 /// 粗略检查指针指向的内存是否已提交且可读（防止 `strlen`/`CStr` 读到坏指针崩溃）。
+///
+/// 只读探测：本函数**不解引用** `p`，因此指针可以没有 provenance 来源。
 pub fn test_readable(p: *const c_void) -> Result<(), PluginError> {
     if p.is_null() {
         return Err(PluginError::InvalidPointer);

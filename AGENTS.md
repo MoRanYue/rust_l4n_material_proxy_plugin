@@ -133,6 +133,50 @@ materialsystem.dll `FUN_10002d50`（RVA `0x2d50`）是引擎解析 VMT `"Proxies
   `make_trampoline` 复制目标前 `patch_len` 字节到 `VirtualAlloc` 分配的可执行内存再 JMP 回
   `target+patch_len`；`uninstall` 用保存的 5 字节还原入口。
 
+## 裸指针创建约定（Strict Provenance）
+
+创建裸指针**优先用 `&raw const` / `&raw mut`**（[Rust 文档「Common ways to create raw pointers」](https://doc.rust-lang.org/std/primitive.pointer.html#common-ways-to-create-raw-pointers)
+第 1/3 条），**不要**写 `&x as *const T` / `&mut x as *mut T`。`lib.rs` 顶部已开启
+`#![warn(clippy::ref_as_ptr)]` 把这条规则钉死（该 lint 属 pedantic、默认关闭）。
+
+按来源分四类处理：
+
+| 指针来源 | 写法 |
+|---|---|
+| 本地变量 / 结构体字段 | `&raw const x`、`&raw mut x`（可对未对齐字段、packed struct 取址） |
+| `Vec`/`Box` 等容器元素 | `&raw mut e.proxy`；容器自身用 `as_ptr()` / `as_mut_ptr()` |
+| 来自 C / Win32 API | 直接用返回值（如 `HMODULE`、`VirtualAlloc` 的 `*mut c_void`），**全程保持指针类型** |
+| 外部裸地址（模块基址+RVA、函数指针转整数） | 见下 |
+
+**Strict Provenance 的关键是"指针全程不降级为整数"**，而非换个函数：
+
+- 需要数值地址时用 `.addr()`（丢弃 provenance，但语义明确），不要写 `p as usize`；
+- `materialsystem.dll` 各引擎函数地址由 `ms_fn(rva)` 返回 **`*const u8`**（`HMODULE` 基址
+  `.add(rva)` 指针算术），不再经 `usize` 中转 —— `HMODULE` 本身就是模块映射基址（Rust 文档
+  第 4 条「Get it from C」），自带 provenance；
+- `engine::get_proxy_parse_addr()` 返回 `*const u8`，`material::install()` 接收 `*const u8`；
+- trampoline 指针来自 `VirtualAlloc`（自带 provenance），`ORIGINAL_PROXY_PARSE` 直接以
+  `*const c_void` 持有，不存成 `usize` 再还原。
+
+> **`with_exposed_provenance` 不是"旧写法兼容"**：它与 `.addr()` 同属 strict provenance 家族
+> （1.84 稳定），用途是"地址来自外部、无法回溯来源"。项目里**仅剩一处**必需：
+> `install()` 链式接管时，下一跳地址由先加载者写在入口的 `E9 rel32` 解码得到
+> （`material.rs`，`ORIGINAL_PROXY_PARSE = with_exposed_provenance::<c_void>(next)`）。
+> `with_exposed_provenance_mut` 已无使用（所有写入都走带 provenance 的指针）。
+
+> **不要用 `transmute` 把空指针变成函数指针再判空**：函数指针不可为 null，
+> `(fn_ptr as *const ()).is_null()` 恒为 `false`（clippy 会报
+> `fn_to_numeric_cast`/`fn_null_check`）。必须先对**源指针**判空再 `transmute`
+> （见 `parse_proxy_params` / `apply_proxies`）。
+
+验证手段（`fuzzy_provenance_casts` / `lossy_provenance_casts` 目前仍是 unstable）：
+
+```powershell
+$env:RUSTC_BOOTSTRAP="1"
+$env:RUSTFLAGS='-Zcrate-attr=feature(strict_provenance_lints) -W fuzzy_provenance_casts -W lossy_provenance_casts'
+cargo build --release   # 当前 0 命中
+```
+
 ## 代理编写约定
 
 - 每个代理独立 struct（参数隔离），实现 [`Proxy`](src/kv.rs) trait：

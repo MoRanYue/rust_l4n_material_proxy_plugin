@@ -21,7 +21,8 @@ pub fn bind_material_system() -> Result<*mut c_void, PluginError> {
             let Some(create) = GetProcAddress(h, s!("CreateInterface")) else { continue; };
             let f: CreateInterfaceFn = core::mem::transmute(create);
             for ver in [MATERIAL_SYSTEM_INTERFACE, MATERIAL_SYSTEM_INTERFACE_OLD] {
-                let ms = f(ver.0 as *const c_char, core::ptr::null_mut());
+                // `ver.0` 已是 `*const u8`，直接 `cast` 成 `*const c_char`（同宽度，非创建新指针）
+                let ms = f(ver.0.cast::<c_char>(), core::ptr::null_mut());
                 if !ms.is_null() {
                     return Ok(ms);
                 }
@@ -32,10 +33,14 @@ pub fn bind_material_system() -> Result<*mut c_void, PluginError> {
     }
 }
 
-/// 获取 proxy 解析函数 `FUN_10002d50` 地址（materialsystem RVA `0x2d50`）。
+/// 获取 proxy 解析函数 `FUN_10002d50` 的入口指针（materialsystem RVA `0x2d50`）。
+///
+/// 返回**带 provenance 的指针**：`HMODULE` 即模块映射基址（来自 C，见 Rust 文档
+/// 「4. Get it from C」），偏移用 `.add()` 做指针算术，全程不经过 `usize`，
+/// 因此 detour 可以直接读写该入口字节。
 /// # Safety
 /// 必须等 `materialsystem.dll` 加载后调用。
-pub unsafe fn get_proxy_parse_addr() -> Result<usize, PluginError> {
+pub unsafe fn get_proxy_parse_addr() -> Result<*const u8, PluginError> {
     let base = GetModuleHandleA(s!("materialsystem.dll"))?;
-    Ok(base.0.add(0x2d50) as usize)
+    Ok(base.0.cast_const().cast::<u8>().add(0x2d50))
 }
