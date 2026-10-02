@@ -13,6 +13,8 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 - 注册用泛型 `material::register_proxy::<T>("代理名")`
 - 导出入口 `GetL4NPluginInstance`（left4neko 调用），见 [`lib.rs`](src/lib.rs)
 - 目标平台：`i686-pc-windows-msvc`（32 位），edition 2024，`cdylib` crate-type
+- 实现 **L4N 插件接口 v2**（`IL4NPlugin`）：`GetInterfaceVersion()` 返回 `2`，
+  虚表槽位 8（字节偏移 `0x20`）为 `RequestHudMenu`，提供游戏内 HUD 菜单，见 [`src/menu.rs`](src/menu.rs)
 
 ## 目录结构
 
@@ -22,8 +24,67 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 | [`src/engine.rs`](src/engine.rs) | IMaterialSystem 绑定 + `FUN_10002d50`（proxy 解析函数）地址获取 |
 | [`src/kv.rs`](src/kv.rs) | `Proxy` trait 定义 + 内存可读性检查（`is_readable`） |
 | [`src/material.rs`](src/material.rs) | 代理注册表、KeyValues 解析、detour hook、D3D EndScene 每帧执行 |
+| [`src/menu.rs`](src/menu.rs) | L4N 接口 v2 的 HUD 菜单（`RequestHudMenu`）：标题、KV 菜单结构、`callback` 子菜单 |
 | [`src/util.rs`](src/util.rs) | 通用小工具：`RelativeCompare`（f32 相对比较，容差 1e-6），供比较类代理复用 |
 | [`src/expr.rs`](src/expr.rs) | 表达式求值器（无依赖）：数学 + 比较（`== != < <= > >=`）+ 逻辑（`&& \|\| !`），供 `l4nrp_math` / `l4nrp_logic` 使用 |
+
+## L4N 插件接口 v2（HUD 菜单）
+
+`l4n_plugin.h` 的接口版本 2 在 `IL4NPluginV1` 的 8 个虚函数之后**只新增了一个槽位**：
+`virtual const char* RequestHudMenu(bool request_title)`，即虚表槽位 8 / 字节偏移 `0x20`。
+
+### 调用链（`left4neko.dll` v2.43.1 反汇编实测）
+
+1. **插件加载器 `FUN_100d30e0`**：遍历 `neko/plugins` 目录，对每个 DLL 调
+   `LoadLibrary` + `GetProcAddress("GetL4NPluginInstance")`，取实例后调用虚表槽位 1
+   `GetInterfaceVersion()`，把结果存进插件表。**表项 12 字节**：
+   `{+0, +4 插件实例指针, +8 GetInterfaceVersion() 返回值}`。
+2. **`PluginManager::BuildHudMenu`（`FUN_100d2970`）**：遍历插件表，`CMP [EDI+8], 0x2` →
+   `version < 2` 的插件**直接跳过**；`version >= 2` 才 `PUSH 0x1` 调用槽位 8
+   （`RequestHudMenu(true)`）。返回 `nullptr` → 该插件没有菜单入口，跳过；
+   返回非空 → 以该字符串为标题建立插件菜单项（插件实例存入菜单项 payload `+0x48`）。
+3. **菜单展开 `FUN_100d35a0`**：用户打开菜单时，从 payload `+0x48` 取插件实例，
+   `PUSH 0x0` 再次调用槽位 8（`RequestHudMenu(false)`），把返回的字符串交给
+   `FUN_10043930`（`tyti::vdf` 解析器），再由 `FUN_10048060` 逐条构建菜单项。
+4. **`callback` 调用 `FUN_100494f0`**：`PUSH [payload+0x4c]`（user_data）→
+   `CALL [payload+0x48]`（callback）→ `ADD ESP, 0x4`，即
+   **`const char* __cdecl f(void* user_data)`**（调用方清栈）。返回值非空则作为子菜单
+   KV 再次走 `FUN_10048060`（`param_3 = 1`，递归支持嵌套 callback）。
+
+### 菜单条目类型（`FUN_10048060`，`param_3 = 1` 分支）
+
+| 键 | 解析 | 激活行为 |
+|---|---|---|
+| `"cmd"` | `HudMenuItemCmdexec` | `FUN_10049300` 把值字符串交给引擎执行 |
+| `"cvar"` | `HudMenuItemConVar` | `FUN_10049350`：`g_pCVar->FindVar(name)`（虚表 `+0x34`），取「当前值 + `delta`」并夹到 `[min, max]` 后写回 |
+| `"callback"` | `CustomCommand::_CallbackEntry` | `FUN_100494f0` 调用函数指针，返回值作为子菜单 |
+| `"user_data"` | 同上（可选） | 作为 `callback` 的参数传入 |
+
+- `"cvar"` 的 `"delta"` 默认 `1.0`，`"min"` 默认 `0`，`"max"` 默认 `1.0`。
+- 三者都没有的条目会被**静默忽略**（不产生菜单项）。
+- `"callback"` / `"user_data"` 的值由 `std::stoul(str, &endptr, 0)` 解析：
+  **base = 0 即自动识别进制，所以 `0x` 十六进制前缀有效**；
+  格式非法会抛 C++ 异常（`"invalid stoul argument"` / `"stoul argument out of range"`），
+  因此这两个字符串必须严格合法。
+
+### KV 结构：必须恰好一个顶层对象
+
+`FUN_10043930` 解析后数顶层条目 `uVar6 = (int)local_70 - (int)local_74 >> 2`：
+
+- `uVar6 == 1` → `FUN_100471e0(*local_74)`，直接取用那**唯一**的顶层对象；
+- `uVar6 >= 2` → 走另一条**未经实测**的合并分支。
+
+`FUN_100d35a0` 把该对象交给 `FUN_10048060`，后者遍历的是**它的子条目**，
+并把对象自身的键名当作菜单标题。所以正确形状是「一个顶层对象 = 标题，其子条目 = 菜单项」，
+与头文件示例一致。返回两个及以上顶层对象会落进未实测分支，故本插件只生成一个。
+
+### 编码与 ABI 约定
+
+- 返回的字符串必须是 **UTF-8**（`neko/config_template.vdf` 即纯 UTF-8 无 BOM）。
+- `bool request_title` 在 MSVC x86 `thiscall` 下占**一个 32 位栈槽**，调用点实测为
+  `PUSH 0x1` / `PUSH 0x0`，故 Rust 侧用 `u8` 接收。
+- 返回的指针必须在 left4neko `strlen` + 解析期间保持有效：本插件返回 `static`/`OnceLock`
+  里的 `CString` 指针，`callback` 的子菜单文本存进 `Mutex<Option<CString>>` 后返回其指针。
 
 ## 逆向背景（为什么不能"正常"创建代理对象）
 
@@ -305,3 +366,9 @@ cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/e
   材质上注册多个 per-frame 代理时只有最后一个生效（如 `l4nrp_print_variable` 被
   `l4nrp_is_in_range` 替换而不执行，表现为"没有每帧输出"）。现改为每条目分配唯一 `id`，同一材质
   可挂多个独立代理；失效条目按 `id` 移除。
+- v6.1：HUD 菜单 `"cvar"` 条目的**夹取方向未完全确定**。`FUN_10049350` 的越界分支在反编译里呈现为
+  `if ((*(float*)(param_1+0x4c) + 1e-06 < local_30) || (local_30 < *(float*)(param_1+0x48) - 1e-06)) local_30 = *(float*)(param_1+0x4c);`
+  —— `+0x48` / `+0x4c` 哪个是 `min`、哪个是 `max`，以及越界时夹到哪一端，未能完全确定。
+  因此 `"菜单横向偏移"` 条目的实际效果是「每次点击把 `l4n_hudmenu_offset_x` 朝某个方向调整」，
+  极端情况下可能直接落到 `±500` 边界（可见但无害、可恢复）。
+  要精确验证需在实机里点击该菜单项并观察 convar 的实际变化方向。

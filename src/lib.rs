@@ -1,4 +1,4 @@
-﻿//! L4N 示例插件：注册自定义材质代理（material proxy）。
+//! L4N 示例插件：注册自定义材质代理（material proxy）。
 //!
 //! VMT `"Proxies"` 块里写代理名即可触发 Rust 回调读写材质 VMT 变量。
 //! 机制 / 逆向依据 / 注意事项见项目根目录 AGENTS.md。
@@ -13,6 +13,7 @@ pub mod engine;
 mod kv;
 mod expr;
 mod material;
+mod menu;
 mod proxy;
 mod util;
 mod error;
@@ -30,6 +31,9 @@ use proxy::*;
 
 // ---------------------------------------------------------------------------
 // IL4NPlugin 虚表（与 bin/neko/plugins/l4n_plugin.h 一致）
+//
+// 槽位 0-7 来自 `IL4NPluginV1`，槽位 8（字节偏移 0x20）是接口版本 2 新增的
+// `IL4NPlugin::RequestHudMenu`——虚表里只有这一个新增槽位，详见 `menu` 模块。
 // ---------------------------------------------------------------------------
 #[repr(C)]
 struct L4NPluginVtable {
@@ -41,6 +45,7 @@ struct L4NPluginVtable {
     on_game_launch: unsafe extern "thiscall" fn(*mut L4NPlugin),
     on_d3d_created: unsafe extern "thiscall" fn(*mut L4NPlugin, *mut c_void),
     on_d3d_device_created: unsafe extern "thiscall" fn(*mut L4NPlugin, *mut c_void, u8),
+    request_hud_menu: unsafe extern "thiscall" fn(*const L4NPlugin, u8) -> *const c_char,
 }
 
 #[repr(C)]
@@ -106,8 +111,11 @@ static VERSION: &CStr = {
 unsafe extern "thiscall" fn dtor(_this: *mut L4NPlugin) {
     material::uninstall();
 }
+/// 返回本插件实现的接口版本。left4neko 的插件加载器把这个返回值存进插件表
+/// （每项 12 字节：`{+0, +4 实例指针, +8 版本号}`），`PluginManager::BuildHudMenu`
+/// （`0x100d2970`）只对 **版本 >= 2** 的插件调用虚表槽位 8 `RequestHudMenu`。
 unsafe extern "thiscall" fn get_interface_version(_this: *const L4NPlugin) -> u32 {
-    1
+    2
 }
 unsafe extern "thiscall" fn get_name(_this: *const L4NPlugin) -> *const c_char {
     NAME.as_ptr()
@@ -198,6 +206,18 @@ unsafe extern "thiscall" fn on_d3d_device_created(
     }
 }
 
+/// `IL4NPlugin::RequestHudMenu`（接口版本 2 新增，虚表槽位 8 / 字节偏移 `0x20`）。
+///
+/// left4neko 以 MSVC x86 的 `thiscall` 调用本函数，`bool request_title` 占一个
+/// 32 位栈槽（调用点实测为 `PUSH 0x1` / `PUSH 0x0`），因此这里用 `u8` 接收。
+/// 返回值语义与实现见 [`menu`]。
+unsafe extern "thiscall" fn request_hud_menu(
+    _this: *const L4NPlugin,
+    request_title: u8,
+) -> *const c_char {
+    menu::request(request_title)
+}
+
 // ---------------------------------------------------------------------------
 // 虚表 + 实例 + 导出
 // ---------------------------------------------------------------------------
@@ -210,6 +230,7 @@ static VTABLE: L4NPluginVtable = L4NPluginVtable {
     on_game_launch,
     on_d3d_created,
     on_d3d_device_created,
+    request_hud_menu,
 };
 
 static INSTANCE: OnceLock<L4NPlugin> = OnceLock::new();

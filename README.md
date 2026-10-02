@@ -2,6 +2,8 @@
 
 L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。在 VMT 的 `"Proxies"` 块里写代理名，即可触发插件回调，回调内可读写该材质的 VMT 变量（变色、比较运算、打印变量等）。
 
+本插件实现了 **L4N 插件接口 v2**（`IL4NPlugin`），除材质代理外还提供一个 **HUD 菜单入口**（见[游戏内 HUD 菜单](#游戏内-hud-菜单)）。
+
 对于添加的材质代理详情，见[`Example.vmt`](/Example.vmt)。
 
 ## 安装
@@ -22,6 +24,10 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
    > 必须是**与 `left4neko.dll` 同目录的 `neko/plugins`**（即游戏安装目录下的`bin/neko/plugins`）。
 
 3. 启动游戏，left4neko 会自动遍历并加载该目录下的所有插件 DLL。
+
+> 本插件要求 **L4N ≥ 2.34.0**（该版本引入 `l4nplugin` 插件系统）与 `l4n_plugin.h` 的 **接口版本 2**。
+> 插件通过 `GetInterfaceVersion()` 返回 `2` 来声明自己支持 `RequestHudMenu`；
+> 若你的 L4N 版本较旧（接口版本 1），left4neko 会跳过 HUD 菜单部分，材质代理功能不受影响。
 
 ## VMT 用法
 
@@ -99,6 +105,37 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 - 代理只能读写**已在 VMT 声明**的变量（引擎只为声明过的变量创建变量对象）。若想让代理写入某个变量，请先在 VMT 顶层声明它，例如 `"$result_var" "0"`。
 - 插件与**原版/L4N 内置材质代理共存**：同一个 `"Proxies"` 块里 `Sine`/`Multiply`/`Sequence`（L4N的材质代理） 与 `l4nrp_*`可同时使用。
 
+## 游戏内 HUD 菜单
+
+插件实现了接口版本 2 新增的 `IL4NPlugin::RequestHudMenu`，因此在 L4N 主菜单（默认按 `\` 打开）里会多出一个 **「L4NRP 材质代理」** 条目。进入后可以看到：
+
+| 菜单项 | 类型 | 行为 |
+|---|---|---|
+| 重新加载所有材质 | `cmd` | 执行 `mat_reloadallmaterials`，改完 VMT 后无需重启即可看到效果 |
+| 检查代理是否生效 | `cmd` | 执行 `l4n_is_proxy_exist l4nrp_math`，在控制台确认代理已挂上引擎 |
+| 菜单横向偏移 | `cvar` | 以步长 `10` 调整 `l4n_hudmenu_offset_x`（范围 `-500` ~ `500`），用来挪动 HUD 菜单位置 |
+| 已注册代理… | `callback` | 展开子菜单，逐个列出本插件已注册的全部材质代理，点任意一项即可用 `l4n_is_proxy_exist` 单独检查它 |
+
+菜单的实现与逆向依据见 [`src/menu.rs`](src/menu.rs) 顶部文档注释。
+
+### 自定义菜单
+
+`RequestHudMenu(false)` 需要返回一段 Valve KeyValues 文本，形状是**恰好一个顶层对象 = 菜单标题，其子条目 = 菜单项**：
+
+```text
+"我的标题" {
+    "项目1" { "cmd" "my_command" }
+    "项目2" { "cvar" "my_cvar" "delta" "1" "min" "0" "max" "10" }
+    "带子菜单的项目" { "callback" "0x12345678" "user_data" "0x87654321" }
+}
+```
+
+- 三种条目类型：`"cmd"`（执行控制台命令）、`"cvar"`（调整控制台变量，可选 `delta`/`min`/`max`）、`"callback"`（调用函数）。
+- `"callback"` 的值是函数地址字符串（支持 `0x` 十六进制前缀），签名为 `const char* __cdecl f(void* user_data)`；返回 `nullptr` 表示不展开子菜单，否则返回子菜单的 KeyValues 文本（可递归嵌套）。
+- `"user_data"` 可选，作为 `callback` 的参数原样传入。
+- 文本必须是 **UTF-8** 编码（neko 自带的 `neko/config_template.vdf` 即纯 UTF-8 无 BOM）。
+- 注意：`callback`/`user_data` 的地址字符串由 left4neko 用 `std::stoul(..., base = 0)` 解析，格式非法会抛 C++ 异常，所以务必保证是合法的数字字符串。
+
 ## 日志 / 验证
 
 插件输出 `l4n_material_proxy_plugin.log`（当前工作目录），同时在引擎控制台以 `[l4n-proxy]` 前缀输出。启动游戏进主菜单后，日志里应能看到代理注册、命中与生效记录：
@@ -106,6 +143,10 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 ```
 [l4n-proxy] registered proxies: ["does_equal", ...]
 [l4n-proxy] proxy parse hook installed ...
+[l4n-proxy] RequestHudMenu(title): 已向 left4neko 注册 HUD 菜单入口
+[l4n-proxy] RequestHudMenu(structure): callback=0x........ user_data=0x........
+[l4n-proxy] 菜单回调被调用（user_data = "L4NRP HUD menu callback"）
+[l4n-proxy] 菜单回调：已注册 14 个代理
 [l4n-proxy] apply_proxies: MATCH 'is_in_range' material=0x..
 [l4n-proxy] is_in_range[vgui/common/l4d_spinner]: $src_var=0.5000 in [$min_var=0.0000,$max_var=1.0000] -> $result_var2=1
 [l4n-proxy] print_variable[vgui/common/l4d_spinner]: $var=0.5000 (float)

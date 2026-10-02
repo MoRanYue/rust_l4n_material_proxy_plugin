@@ -1,1 +1,5 @@
 /target
+
+# 插件运行时日志（在进程当前工作目录生成；本地验证时会落在仓库根目录）
+/l4n_material_proxy_plugin.log
+*.log
