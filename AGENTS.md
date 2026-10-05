@@ -318,6 +318,18 @@ material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
 > `$name` 或 `name` 经 `get_float` 读取变量（未定义按 0.0），**结果写 `result`（整型 0/1，用
 > `set_int`）**，每帧重算。
 >
+> **用表达式替换 `LessOrEqual` 串（帧数探测）**：引擎的 `LessOrEqual` 是**二选一（select）**
+> 而非布尔 —— `srcVar1 <= srcVar2 ? LessEqualVar : greaterVar`，输出的是两个值之一。只有两个分支
+> 都能化简成 0/1 时才等价于一条 `l4nrp_logic` 表达式。指南 RNG 的帧数探测恰好满足，三行改写：
+> `l4nrp_math "max(maxFrame, checkMax)" → $maxFrame`；
+> `l4nrp_logic "(countingFinished || checkMax <= 0) && maxFrame > 0" → $countingFinished`（闩锁）；
+> `l4nrp_math "maxFrame + 1 + invisibleIsAlsoASkinHere" → $frameLimit`。
+> **组合条件必须加括号**：`&&` 优先级低于 `<=`/`>`，漏括号会静默改变语义。
+> 互读依据（[`materialsystem.dll`](src/material.rs) 反编译）：`SetIntValue`(+0x10) 会把
+> `(float)v` 同时填进浮点槽 `+0xc`，而 `GetFloatValue`(+0x6c) 读的正是 `+0xc` —— 所以
+> `l4nrp_logic` 写出的 0/1 能被 `l4nrp_math` / `l4nrp_random` 的 `gate` 精确读回（反向 float→int 截断）。
+> 等价性由 [`src/expr.rs`](src/expr.rs) 的 `rng_frame_probe_matches_engine_chain` 单测逐帧兜底。
+>
 > **`l4nrp_delay_set` 延迟置位**：检测 `trigger`（整型，`get_int`）非 0 的**上升沿**后，向全局
 > 计时器注册表（[`material.rs`](src/material.rs) `start_timer`）申请一个 **UUID v4 字符串手柄**
 > （`uuid` crate `Uuid::new_v4()`）并计时 `delay` 毫秒；`value` 变量（整型，`get_int`）在**触发（上升沿）

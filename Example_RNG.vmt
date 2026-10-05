@@ -7,13 +7,15 @@
 //
 // 指南原版要用 AnimatedTexture 数出帧数，再用 CurrentTime / EntityRandom /
 // PlayerProximity / ConVar 等十几个引擎代理做溢出钳制与重掷，光中间变量就
-// 三十多个。本文件把「随机」那部分整体换成一行 l4nrp_random。
+// 三十多个。本文件把「随机」那部分整体换成一行 l4nrp_random，把帧数探测里
+// 的 3 个 LessOrEqual + 2 个 Add 压成 1 个 l4nrp_logic + 2 个 l4nrp_math。
 //
 // ---------------------------------------------------------------------
 // 原版 vs 本插件
 // ---------------------------------------------------------------------
-//   帧数探测     保留（AnimatedTexture + LessOrEqual）—— 只有它能数出
-//                "这个 VTF 有几帧"，插件无法替代；
+//   帧数探测     指南 3 个 LessOrEqual + 2 个 Add
+//                → l4nrp_math ×2 + l4nrp_logic ×1
+//                  （AnimatedTexture 必须保留：只有它能数出 VTF 有几帧）；
 //   随机         指南 ~40 个代理 → l4nrp_random 1 个；
 //   溢出钳制     指南用 Subtract/LessOrEqual 绕一圈把随机值夹进 [0,帧数)
 //                → l4nrp_random 的 min/max 直接缩放；
@@ -23,6 +25,26 @@
 //                → l4nrp_random 的 shared（可选）；
 //   静态物体     指南必须改用 🔶 版本（EntityRandom 对不动的物体无效）
 //                → 本版本对静态物体同样有效，无需换文件。
+//
+// ---------------------------------------------------------------------
+// 帧数探测为什么能压
+// ---------------------------------------------------------------------
+//   指南那 5 个代理其实只在做三件事：
+//     maxFrame         = max(maxFrame, checkMax)          ← 运行最大值
+//     countingFinished = (maxFrame > 0) && (countingFinished || checkMax <= 0)
+//                                                         ← "数完一轮" 闩锁
+//     frameLimit       = maxFrame + 1 + invisibleIsAlsoASkinHere
+//   前两件事写成表达式就是下面 l4nrp_math / l4nrp_logic 各一行。
+//
+//   LessOrEqual 之所以看着别扭，是因为它是**二选一（select）而不是布尔**：
+//       srcVar1 <= srcVar2 ? LessEqualVar : greaterVar
+//   只有把它的两个分支都化简成 0/1 之后，才能改用 l4nrp_logic 表达 ——
+//   这里恰好可以：$countingFinished 的取值恒为 0 或 1。
+//
+//   注意 l4nrp_logic 里 `&&` / `||` 的优先级**低于**比较运算符，所以组合
+//   条件必须加括号，写成 (countingFinished || checkMax <= 0) && maxFrame > 0；
+//   若省成 countingFinished || checkMax <= 0 && maxFrame > 0，会被解析成
+//   countingFinished || ((checkMax <= 0) && (maxFrame > 0))，语义就错了。
 //
 // ---------------------------------------------------------------------
 // 用法
@@ -46,64 +68,46 @@ VertexLitGeneric
     "$invisibleIsAlsoASkinHere" "0"
 
     // ---------- 帧数探测所需的变量 ----------
-    "$checkMax"        "0.0" // AnimatedTexture 把当前帧号写在这里
-    "$maxFrame"        "0.0" // 探测到的最大帧号（= 帧数 - 1）
-    "$maxFramePlusOne" "1.0" // = 帧数
+    "$checkMax"         "0.0" // AnimatedTexture 把当前帧号写在这里
+    "$maxFrame"         "0.0" // 探测到的最大帧号（= 帧数 - 1）
     "$countingFinished" "0.0" // 1 = 已经数完一轮
-    "$zero" "0.0"
-    "$one"  "1.0"
 
     // ---------- l4nrp_random 的输入 / 输出 ----------
-    "$frameLimit" "1.0" // 随机上界 = 帧数（下面 Add 算出）
+    "$frameLimit" "1.0" // 随机上界 = 帧数（由下面的 l4nrp_math 算出）
     "$frame"      "0.0" // 输出：着色器读的帧号
 
     "Proxies"
     {
         // =============================================================
-        // 1) 帧数探测（保留指南原样）
+        // 1) 帧数探测
+        //
+        //    指南的 3 个 LessOrEqual + 2 个 Add 等价于下面三个代理：
+        //      l4nrp_math  → maxFrame         = 运行最大值
+        //      l4nrp_logic → countingFinished = 闩锁（推导见文件头）
+        //      l4nrp_math  → frameLimit       = 帧数
         // =============================================================
 
-        // 把每帧的 $checkMax 累积进 $maxFrame，取到最大值
-        // LessOrEqual 语义：srcVar1 <= srcVar2 ? LessEqualVar : greaterVar
-        LessOrEqual
+        // 运行最大值：每帧把新的 $checkMax 累积进来
+        l4nrp_math
         {
-            LessEqualVar "$maxFrame"    // checkMax <= maxFrame 时保持不变
-            greaterVar   "$checkMax"    // 否则取新的更大值
-            srcVar1      "$checkMax"
-            srcVar2      "$maxFrame"
-            resultVar    "$maxFrame"
+            expr   "max(maxFrame, checkMax)"
+            result "$maxFrame"
         }
-        // $checkMax 归零 → 说明动画走完了一轮
-        LessOrEqual
+        // "数完一轮" 闩锁：
+        //   maxFrame > 0 才可能置位（一帧都没数到就不算数），
+        //   置位后靠 || 自己保持（$checkMax 再次归零也不会清掉）。
+        // 括号不能省：&& 优先级低于 <= 与 >。
+        l4nrp_logic
         {
-            LessEqualVar "$one"
-            greaterVar   "$countingFinished"
-            srcVar1      "$checkMax"
-            srcVar2      "$zero"
-            resultVar    "$countingFinished"
+            expr   "(countingFinished || checkMax <= 0) && maxFrame > 0"
+            result "$countingFinished"
         }
-        // 但一帧都没数到就不算数
-        LessOrEqual
+        // 帧数 = 最大帧号 + 1；若隐形帧也算皮肤，上界再 +1
+        //（指南原本用 $maxFramePlusOne 中转，这里直接一步算出 $frameLimit）
+        l4nrp_math
         {
-            LessEqualVar "$zero"
-            greaterVar   "$countingFinished"
-            srcVar1      "$maxFrame"
-            srcVar2      "$zero"
-            resultVar    "$countingFinished"
-        }
-        // 帧数 = 最大帧号 + 1
-        Add
-        {
-            srcVar1  "$maxFrame"
-            srcVar2  "$one"
-            resultVar "$maxFramePlusOne"
-        }
-        // 若隐形帧也算皮肤，上界再 +1
-        Add
-        {
-            srcVar1  "$invisibleIsAlsoASkinHere"
-            srcVar2  "$maxFramePlusOne"
-            resultVar "$frameLimit"
+            expr   "maxFrame + 1 + invisibleIsAlsoASkinHere"
+            result "$frameLimit"
         }
 
         // 驱动帧号（必须保留，否则 $checkMax 不会变）

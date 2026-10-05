@@ -17,6 +17,11 @@
 //   完成，指南里那一长串 $randSYS/$randSYSTemp/$randSYSOverflow/
 //   $prepareStore/$randSYSStored/$randSYSInject 都不再需要。
 //
+// 帧数探测部分与 Example_RNG.vmt 一样，把指南的 3 个 LessOrEqual + 1 个 Add
+// 压成 1 个 l4nrp_logic + 2 个 l4nrp_math（推导见 Example_RNG.vmt 文件头）。
+// 本文件里 $maxFramePlusOne 被 l4nrp_random 的 max 使用，所以它仍然保留为
+// 独立变量。
+//
 // ---------------------------------------------------------------------
 // 用法
 // ---------------------------------------------------------------------
@@ -24,6 +29,13 @@
 //   2. 把 $basetexture 换成你的 VTF；
 //   3. 需要"每个实体一个皮肤"就必须保留 unit 参数（下面已接好）；
 //      如果只想要"每次加载随机一次"，删掉 unit 那一行即可。
+//
+// 关于 $invisibleIsAlsoASkinHere：
+//   指南 🔵 原版把它接进 $clampLimit 那一串 LessOrEqual；本插件里
+//   l4nrp_random 的 min/max 本身就会把结果夹在 [0,帧数) 内，那一串已经不需要，
+//   所以这个开关目前**不影响输出**（与上一版示例一致）。若你的 VTF 里有一帧是
+//   全透明的、并且希望把它也算作一个皮肤，把下面那条 l4nrp_math 的表达式改成
+//   "maxFrame + 1 + invisibleIsAlsoASkinHere" 即可（⚪️ 版就是这么写的）。
 //
 // 关于 $boomerEffects / $meleeBloodEffects：
 //   指南用它控制 Boomer 胆汁与近战血迹的 $detail 效果（依赖 L4N 的
@@ -36,15 +48,13 @@ VertexLitGeneric
 
     // ---------- 可调参数 ----------
     "$oneSkinPerMap" "0"
-    "$invisibleIsAlsoASkinHere" "0"
+    "$invisibleIsAlsoASkinHere" "0" // 见文件头说明（当前不影响输出）
 
     // ---------- 帧数探测所需的变量 ----------
     "$checkMax"         "0.0"
     "$maxFrame"         "0.0"
     "$maxFramePlusOne"  "1.0"
     "$countingFinished" "0.0"
-    "$zero" "0.0"
-    "$one"  "1.0"
 
     // ---------- 随机源（EntityRandom 对同一实体稳定） ----------
     "$entityUnit" "0.0"
@@ -55,37 +65,23 @@ VertexLitGeneric
     "Proxies"
     {
         // =============================================================
-        // 1) 帧数探测（与 Example_RNG.vmt 相同）
+        // 1) 帧数探测（与 Example_RNG.vmt 相同：3 个 LessOrEqual + 1 个 Add
+        //    压成 2 个 l4nrp_math + 1 个 l4nrp_logic）
         // =============================================================
-        LessOrEqual
+        l4nrp_math
         {
-            LessEqualVar "$maxFrame"
-            greaterVar   "$checkMax"
-            srcVar1      "$checkMax"
-            srcVar2      "$maxFrame"
-            resultVar    "$maxFrame"
+            expr   "max(maxFrame, checkMax)"
+            result "$maxFrame"
         }
-        LessOrEqual
+        l4nrp_logic
         {
-            LessEqualVar "$one"
-            greaterVar   "$countingFinished"
-            srcVar1      "$checkMax"
-            srcVar2      "$zero"
-            resultVar    "$countingFinished"
+            expr   "(countingFinished || checkMax <= 0) && maxFrame > 0"
+            result "$countingFinished"
         }
-        LessOrEqual
+        l4nrp_math
         {
-            LessEqualVar "$zero"
-            greaterVar   "$countingFinished"
-            srcVar1      "$maxFrame"
-            srcVar2      "$zero"
-            resultVar    "$countingFinished"
-        }
-        Add
-        {
-            srcVar1  "$maxFrame"
-            srcVar2  "$one"
-            resultVar "$maxFramePlusOne"
+            expr   "maxFrame + 1"
+            result "$maxFramePlusOne"
         }
         AnimatedTexture
         {

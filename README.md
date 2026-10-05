@@ -11,7 +11,7 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 | 文件 | 说明 |
 |---|---|
 | [`Example.vmt`](Example.vmt) | 全部内置代理的参数用法演示 |
-| [`Example_RNG.vmt`](Example_RNG.vmt) | **随机皮肤**：改写自 Steam 指南 [RNG in 10 seconds (for modders)](https://steamcommunity.com/sharedfiles/filedetails/?id=2389582650) 的 ⚪️ 版，指南里约 40 个代理 → `l4nrp_random` 1 个 |
+| [`Example_RNG.vmt`](Example_RNG.vmt) | **随机皮肤**：改写自 Steam 指南 [RNG in 10 seconds (for modders)](https://steamcommunity.com/sharedfiles/filedetails/?id=2389582650) 的 ⚪️ 版，指南里约 40 个代理 → `l4nrp_random` 1 个 + 帧数探测 3 个 |
 | [`Example_RNG_Map.vmt`](Example_RNG_Map.vmt) | 同上 🔶 版（地图静态物件 / 按玩家位置换皮肤） |
 | [`Example_RNG_Entity.vmt`](Example_RNG_Entity.vmt) | 同上 🔵 版（幸存者等实体，尸体与生前皮肤一致） |
 
@@ -21,12 +21,33 @@ Steam 指南 [RNG in 10 seconds](https://steamcommunity.com/sharedfiles/filedeta
 
 | 环节 | 指南原版 | 本插件 |
 |---|---|---|
-| 帧数探测 | `AnimatedTexture` + `LessOrEqual` | **保留**（只有它能数出 VTF 有几帧） |
+| 帧数探测 | `AnimatedTexture` + 3 个 `LessOrEqual` + `Add` | `AnimatedTexture`（**必须保留**，只有它能数出 VTF 有几帧）+ `l4nrp_math` ×2 + `l4nrp_logic` ×1 |
 | 随机 | `EntityRandom` + `CurrentTime` + `PlayerProximity` | `l4nrp_random` |
 | 溢出钳制 | `Subtract`/`LessOrEqual` 绕一圈夹进 `[0,帧数)` | `min`/`max` 直接缩放 |
 | 重掷信号 | `ConVar` 读 `cl_buy_favorite_nowarn` | `trigger`（可选） |
 | 每地图固定一个皮肤 | `$prepareStore`/`$randSYSStored`/`$randSYSInject` 三变量比对 | `shared`（可选） |
 | 静态物件（地图道具） | 必须换用 🔶 版，否则加载即崩溃 | 无需换文件（不依赖实体） |
+
+#### 帧数探测为什么能压成表达式
+
+指南那串 `LessOrEqual` 看着绕，是因为它其实是**二选一（select）而不是布尔**：
+
+```text
+LessOrEqual:  srcVar1 <= srcVar2 ? LessEqualVar : greaterVar
+```
+
+只有当两个分支都能化简成 0/1 时，它才等价于一条逻辑表达式。帧数探测恰好满足，三件事各写成一行：
+
+| 原版 | 改写 |
+|---|---|
+| 3 个 `LessOrEqual`（含 `$zero`/`$one` 常量变量） | `l4nrp_logic`：`(countingFinished \|\| checkMax <= 0) && maxFrame > 0` |
+| `Add` 求运行最大值 | `l4nrp_math`：`max(maxFrame, checkMax)` |
+| `Add` 求帧数上界 | `l4nrp_math`：`maxFrame + 1 + invisibleIsAlsoASkinHere` |
+
+- `maxFrame` 是运行最大值，`countingFinished` 是**闩锁**：`maxFrame > 0` 才可能置位，置位后靠 `||` 自己保持。
+- 组合条件**必须加括号**：`&&` 的优先级低于 `<=` / `>`，`a || b <= 0 && c > 0` 会被解析成 `a || ((b <= 0) && (c > 0))`。
+- `l4nrp_logic` 用 `set_int` 写 0/1，而引擎的 `SetIntValue` 会同时把 `(float)v` 填进浮点槽（`GetFloatValue` 读的就是那里），所以它的输出能被 `l4nrp_math`、`l4nrp_random` 的 `gate` 精确读回。
+- 等价性有单元测试兜底：`src/expr.rs` 的 `rng_frame_probe_matches_engine_chain` 逐帧跑完整动画循环，断言改写版与指南原版链输出完全一致。
 
 ## 安装
 

@@ -497,4 +497,71 @@ mod tests {
         assert_eq!(logic("in_range_exclusively($v, 0, 3)").unwrap(), 1.0);
         assert_eq!(logic("in_range($v, $min, 3) && !$off").unwrap(), 1.0); // 未定义按 0
     }
+
+    /// 三份 RNG 示例 VMT 的帧数探测：指南原版是 3 个 `LessOrEqual` + `Add`，
+    /// 示例文件改写成了 `l4nrp_math` ×2 + `l4nrp_logic` ×1。这里逐帧跑完整段
+    /// 动画循环，断言两种写法输出完全一致 —— 改写一旦走样，本测试就会失败。
+    ///
+    /// `LessOrEqual` 语义（指南用法反推）：`srcVar1 <= srcVar2 ? LessEqualVar : greaterVar`，
+    /// 即二选一（select），不是布尔 —— 所以只有当两个分支都能化简成 0/1 时才等价于逻辑式。
+    #[test]
+    fn rng_frame_probe_matches_engine_chain() {
+        // 原版：3 个 LessOrEqual（顺序与 VMT 中一致）
+        fn engine(check_max: f32, max_frame: f32, counting: f32) -> (f32, f32) {
+            let max_frame = if check_max <= max_frame {
+                max_frame
+            } else {
+                check_max
+            };
+            let counting = if check_max <= 0.0 { 1.0 } else { counting };
+            let counting = if max_frame <= 0.0 { 0.0 } else { counting };
+            (max_frame, counting)
+        }
+        // 改写版：l4nrp_math 算运行最大值，l4nrp_logic 算闩锁
+        fn plugin(check_max: f32, max_frame: f32, counting: f32) -> (f32, f32) {
+            let mut rf = |n: &str| match n {
+                "checkMax" => check_max,
+                "maxFrame" => max_frame,
+                "countingFinished" => counting,
+                _ => 0.0,
+            };
+            let max_frame = eval_math("max(maxFrame, checkMax)", &mut rf)
+                .map_err(|e| e.0)
+                .unwrap();
+            // 第二个闭包捕获刚算出的 maxFrame（代理按 VMT 书写顺序执行）
+            let mut rf = |n: &str| match n {
+                "checkMax" => check_max,
+                "maxFrame" => max_frame,
+                "countingFinished" => counting,
+                _ => 0.0,
+            };
+            let counting = eval_logic(
+                "(countingFinished || checkMax <= 0) && maxFrame > 0",
+                &mut rf,
+            )
+            .map_err(|e| e.0)
+            .unwrap();
+            (max_frame, counting)
+        }
+
+        // AnimatedTexture 以 25fps 循环写入帧号：0,1,2,3,0,1,2,3,...
+        let seq = [0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0, 0.0, 1.0, 2.0, 3.0];
+        let (mut em, mut ec) = (0.0f32, 0.0f32);
+        let (mut pm, mut pc) = (0.0f32, 0.0f32);
+        for &check_max in &seq {
+            let (a, b) = engine(check_max, em, ec);
+            em = a;
+            ec = b;
+            let (a, b) = plugin(check_max, pm, pc);
+            pm = a;
+            pc = b;
+            assert_eq!(
+                (em, ec),
+                (pm, pc),
+                "checkMax={check_max} 时两种写法结果不同"
+            );
+        }
+        // 4 帧动画走完一轮后：最大帧号 3、闩锁已置位
+        assert_eq!((em, ec), (3.0, 1.0));
+    }
 }

@@ -18,6 +18,11 @@
 //   「皮肤随玩家位置变化」的效果，用 l4nrp_random 的 unit 参数接
 //   PlayerPosition 即可（见下），此时它就是 🔶 的等价物。
 //
+// 帧数探测部分与 Example_RNG.vmt 一样，把指南的 3 个 LessOrEqual + 1 个 Add
+// 压成 1 个 l4nrp_logic + 2 个 l4nrp_math（推导见 Example_RNG.vmt 文件头）。
+// 本文件里 $maxFramePlusOne 被 Multiply 与 l4nrp_random 两处使用，
+// 所以它仍然保留为独立变量，没有并进 $distanceRollback 的表达式。
+//
 // ---------------------------------------------------------------------
 // 用法
 // ---------------------------------------------------------------------
@@ -39,8 +44,7 @@ VertexLitGeneric
     "$maxFrame"         "0.0"
     "$maxFramePlusOne"  "1.0"
     "$countingFinished" "0.0"
-    "$zero" "0.0"
-    "$one"  "1.0"
+    "$zero" "0.0" // 下面两个 Clamp 取向量分量时要用
 
     // ---------- 玩家位置 → [0,1) 随机比例 ----------
     "$pos"         "[0 0 0]" // PlayerPosition 输出（向量）
@@ -55,37 +59,23 @@ VertexLitGeneric
     "Proxies"
     {
         // =============================================================
-        // 1) 帧数探测（与 Example_RNG.vmt 相同）
+        // 1) 帧数探测（与 Example_RNG.vmt 相同：3 个 LessOrEqual + 1 个 Add
+        //    压成 2 个 l4nrp_math + 1 个 l4nrp_logic）
         // =============================================================
-        LessOrEqual
+        l4nrp_math
         {
-            LessEqualVar "$maxFrame"
-            greaterVar   "$checkMax"
-            srcVar1      "$checkMax"
-            srcVar2      "$maxFrame"
-            resultVar    "$maxFrame"
+            expr   "max(maxFrame, checkMax)"
+            result "$maxFrame"
         }
-        LessOrEqual
+        l4nrp_logic
         {
-            LessEqualVar "$one"
-            greaterVar   "$countingFinished"
-            srcVar1      "$checkMax"
-            srcVar2      "$zero"
-            resultVar    "$countingFinished"
+            expr   "(countingFinished || checkMax <= 0) && maxFrame > 0"
+            result "$countingFinished"
         }
-        LessOrEqual
+        l4nrp_math
         {
-            LessEqualVar "$zero"
-            greaterVar   "$countingFinished"
-            srcVar1      "$maxFrame"
-            srcVar2      "$zero"
-            resultVar    "$countingFinished"
-        }
-        Add
-        {
-            srcVar1  "$maxFrame"
-            srcVar2  "$one"
-            resultVar "$maxFramePlusOne"
+            expr   "maxFrame + 1"
+            result "$maxFramePlusOne"
         }
         AnimatedTexture
         {
