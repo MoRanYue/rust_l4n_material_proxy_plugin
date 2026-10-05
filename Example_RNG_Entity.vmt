@@ -1,0 +1,126 @@
+// =====================================================================
+// Example_RNG_Entity.vmt —— 随机皮肤示例（幸存者 / 实体版）
+//
+// 改写自 Steam 指南 "RNG in 10 seconds (for modders)" by Ellie
+//   https://steamcommunity.com/sharedfiles/filedetails/?id=2389582650
+//   对应指南的 🔵 "RNG Entity 2020 (inline)"
+//
+// 指南为什么需要这个版本：
+//   幸存者（以及手持/掉落的武器）用 ⚪️ 版本时，尸体的皮肤会和生前不一致；
+//   🔵 用 EntityRandom 而不是 PlayerProximity 来判断"是不是实体"，让同一实体
+//   在整条生命周期里拿到同一个皮肤。
+//
+// 本插件的做法：
+//   把 EntityRandom 的输出当**随机源**接给 l4nrp_random 的 unit 参数。
+//   EntityRandom 对同一个实体是稳定的，所以生前死后皮肤一致这一性质保留；
+//   而"把这个 [0,1) 比例缩放到 [0,帧数)"以及溢出钳制全部由 l4nrp_random
+//   完成，指南里那一长串 $randSYS/$randSYSTemp/$randSYSOverflow/
+//   $prepareStore/$randSYSStored/$randSYSInject 都不再需要。
+//
+// ---------------------------------------------------------------------
+// 用法
+// ---------------------------------------------------------------------
+//   1. 多帧 VTF（每帧一个皮肤）；
+//   2. 把 $basetexture 换成你的 VTF；
+//   3. 需要"每个实体一个皮肤"就必须保留 unit 参数（下面已接好）；
+//      如果只想要"每次加载随机一次"，删掉 unit 那一行即可。
+//
+// 关于 $boomerEffects / $meleeBloodEffects：
+//   指南用它控制 Boomer 胆汁与近战血迹的 $detail 效果（依赖 L4N 的
+//   IT / BloodyHands 代理）。那部分与本插件无关，需要时把指南原文的
+//   $detail 相关行取消注释并保留 IT / BloodyHands 两个代理即可。
+// =====================================================================
+VertexLitGeneric
+{
+    "$basetexture" "models/survivors/your_multiframe_texture"
+
+    // ---------- 可调参数 ----------
+    "$oneSkinPerMap" "0"
+    "$invisibleIsAlsoASkinHere" "0"
+
+    // ---------- 帧数探测所需的变量 ----------
+    "$checkMax"         "0.0"
+    "$maxFrame"         "0.0"
+    "$maxFramePlusOne"  "1.0"
+    "$countingFinished" "0.0"
+    "$zero" "0.0"
+    "$one"  "1.0"
+
+    // ---------- 随机源（EntityRandom 对同一实体稳定） ----------
+    "$entityUnit" "0.0"
+
+    // ---------- l4nrp_random 的输入 / 输出 ----------
+    "$frame" "0.0" // 输出帧号（上界直接用 $maxFramePlusOne = 帧数）
+
+    "Proxies"
+    {
+        // =============================================================
+        // 1) 帧数探测（与 Example_RNG.vmt 相同）
+        // =============================================================
+        LessOrEqual
+        {
+            LessEqualVar "$maxFrame"
+            greaterVar   "$checkMax"
+            srcVar1      "$checkMax"
+            srcVar2      "$maxFrame"
+            resultVar    "$maxFrame"
+        }
+        LessOrEqual
+        {
+            LessEqualVar "$one"
+            greaterVar   "$countingFinished"
+            srcVar1      "$checkMax"
+            srcVar2      "$zero"
+            resultVar    "$countingFinished"
+        }
+        LessOrEqual
+        {
+            LessEqualVar "$zero"
+            greaterVar   "$countingFinished"
+            srcVar1      "$maxFrame"
+            srcVar2      "$zero"
+            resultVar    "$countingFinished"
+        }
+        Add
+        {
+            srcVar1  "$maxFrame"
+            srcVar2  "$one"
+            resultVar "$maxFramePlusOne"
+        }
+        AnimatedTexture
+        {
+            animatedtexturevar         "$basetexture"
+            animatedtextureframenumvar "$checkMax"
+            animatedtextureframerate   "25"
+        }
+
+        // =============================================================
+        // 2) 每个实体一个随机比例
+        //
+        //    EntityRandom 的 scale 给 1，输出落在 [0,1)；
+        //    它由实体 ID 播种，所以同一个幸存者（含尸体）始终拿到同一个值。
+        // =============================================================
+        EntityRandom
+        {
+            scale     "1"
+            resultVar "$entityUnit"
+        }
+
+        // =============================================================
+        // 3) 随机皮肤
+        //
+        //    unit 接 $entityUnit：用实体随机源而不是内部 PRNG。
+        //    gate 接 $countingFinished：数完帧才开始写 $frame。
+        // =============================================================
+        l4nrp_random
+        {
+            min     "0"
+            max     "$maxFramePlusOne"
+            result  "$frame"
+            unit    "$entityUnit"
+            gate    "$countingFinished"
+            integer "1"
+            shared  "$oneSkinPerMap"
+        }
+    }
+}

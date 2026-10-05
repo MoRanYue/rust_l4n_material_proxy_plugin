@@ -1,6 +1,6 @@
 [package]
 name = "rust_l4n_material_proxy_plugin"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Rust L4N plugin: register custom material proxies (VMT $proxy) to Rust functions with configurable params"
 
@@ -16,6 +16,7 @@ panic = "abort"
 
 [dependencies]
 anyhow = "1.0.104"
+rand = "0.10.3"
 thiserror = "2.0.20"
 uuid = { version = "1.24.0", features = ["v4"] }
 windows = { version = "0.62.2", features = ["Win32_System_Diagnostics_Debug", "Win32_System_LibraryLoader", "Win32_System_Memory"] }

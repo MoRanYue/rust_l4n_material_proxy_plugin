@@ -1030,3 +1030,443 @@ impl Proxy for DelayAbortProxy {
         Ok(())
     }
 }
+
+// ---------- l4nrp_random 的辅助类型 / 函数 ----------
+
+/// 数值参数：既可以是字面量（`"500"`），也可以是材质变量名（`"$max_frame"`）。
+///
+/// 其它代理把 `min`/`max` 一律当变量名，写 `"min" "0"` 会查不到变量而报错；
+/// 本代理先尝试按数字解析，解析不了才当变量名，因此两种写法都能用。
+struct NumParam {
+    name: String,
+    c: CString,
+    lit: Option<f32>,
+}
+impl NumParam {
+    fn new(default: &str) -> Self {
+        Self {
+            name: default.to_string(),
+            c: cstr_of(default),
+            lit: default.trim().parse::<f32>().ok(),
+        }
+    }
+    fn set(&mut self, value: &str) {
+        self.lit = value.trim().parse::<f32>().ok();
+        set_kv(&mut self.name, &mut self.c, value);
+    }
+    /// 解析当前值：字面量直接用；否则读材质变量，读不到返回 `fallback`。
+    ///
+    /// # Safety
+    /// `material` 必须是有效的 `IMaterial*`。
+    unsafe fn resolve(&self, material: *mut c_void, fallback: f32) -> f32 {
+        if let Some(v) = self.lit {
+            return v;
+        }
+        read_number(material, &self.c).unwrap_or(fallback)
+    }
+}
+
+/// 把 `[0,1)` 的随机比例映射到 `[lo, hi]`；`integer` 为真时向下取整。
+fn scale_unit(unit: f32, lo: f32, hi: f32, integer: bool) -> f32 {
+    let v = lo + (hi - lo) * unit;
+    if integer { v.floor() } else { v }
+}
+
+/// 读取材质变量的数值（浮点优先，整数兜底）。
+///
+/// 实测（materialsystem.dll `CMaterialVar`）：`SetFloatValue`(+0x0c) 与 `SetIntValue`(+0x10)
+/// **都会同时同步两个字段** —— 前者 `MOVSS [this+0x0c]` 后再 `CVTTSS2SI` 写 `[this+0x08]`，
+/// 后者 `MOV [this+0x08]` 后再 `CVTSI2SS` 写 `[this+0x0c]`。因此无论 VMT 里写 `"0"`（整型）
+/// 还是 `"0.0"`（浮点），`GetFloatValue`(+0x6c) 都能读到正确数值，整数兜底实际只在
+/// 变量类型异常时兜底。
+///
+/// # Safety
+/// `material` 必须是有效的 `IMaterial*`。
+unsafe fn read_number(material: *mut c_void, name: &CString) -> Option<f32> {
+    let v = material::find_var(material, name).ok()?;
+    if let Ok(f) = material::get_float(v) {
+        return Some(f);
+    }
+    material::get_int(v).ok().map(|i| i as f32)
+}
+
+/// VMT 里的布尔值：`1` / `true` / `yes` / `on` 视为真（不区分大小写）。
+fn kv_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// 进程级共享盐：整个游戏运行期间固定，用于 `$oneSkinPerMap` 语义。
+///
+/// 每个材质实例都用它播种，于是同一帧/同一地图内所有实例得到相同的随机比例。
+/// 惰性初始化（首次 `reseed` 时取一次系统时间）。
+fn shared_salt() -> u32 {
+    static SALT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SALT.get_or_init(|| {
+        let n = now_nanos();
+        if n == 0 { 0x5BF0_3635 } else { n }
+    })
+}
+
+/// 当前系统时间（纳秒与秒混合），作为熵来源。
+fn now_nanos() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
+/// 为 `l4nrp_random` 播种：混合系统时间、材质实例地址、额外熵与重掷计数。
+///
+/// `material` 只当熵用（`addr()` 不解引用），因此静态物体（地图物件）也能拿到
+/// 稳定的、每个实例不同的种子。`shared` 为真时**只用进程级共享盐**（见 [`shared_salt`]）：
+/// 不掺时间、地址与计数，于是同一次游戏运行内所有实例、无论何时重掷，都得到同一个种子
+/// → 同一个随机比例 → 同一张皮肤，即指南里的 `$oneSkinPerMap`。
+fn reseed(material: *mut c_void, extra: u32, counter: u32, shared: bool) -> u64 {
+    if shared {
+        // 共享模式：只用进程级盐，**不掺**时间/地址/计数/额外熵 ——
+        // 否则先重掷与后重掷的实例会分叉，`$oneSkinPerMap` 失效。
+        return shared_salt() as u64;
+    }
+    let entropy =
+        (now_nanos() as u64) ^ (material.addr() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    entropy.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (extra as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ (counter as u64).wrapping_mul(0x1656_67B1_9E37_79F9)
+}
+
+/// l4nrp_random —— 稳定的伪随机数：按材质实例播种一次，之后只在 `trigger` 变化时重掷。
+///
+/// 与引擎自带的 `EntityRandom` 相比：
+/// - **静态物体也能用**：不依赖实体，种子来自材质实例地址 + 系统时间 + 可选 `seed`；
+/// - **帧间稳定**：只在播种/重掷时更新，不会每帧乱跳；
+/// - **`min`/`max` 每帧重新读取**：上界变量（如探测出来的帧数）变大时结果按比例跟随，
+///   不需要原版 RNG 代码里那一长串溢出/钳制代理。
+///
+/// 参数（键名不区分大小写）：
+/// - `min` / `max`：取值范围，字面量或变量名，默认 `0` / `1`；`max < min` 时自动交换。
+/// - `result`：输出变量，默认 `$random_result`。
+/// - `gate`（可选）：门控变量，为 0 时本代理完全不动作（不重掷也不写出）。
+///   典型用法是接「帧数探测完成」标志，等上界稳定后再选皮肤，避免加载瞬间连跳几帧。
+/// - `trigger`（可选）：整型触发器变量，其值**发生变化**时重掷。
+/// - `seed`（可选）：额外熵来源（浮点变量），重掷时混入。
+/// - `unit`（可选）：外部 `[0,1)` 随机源变量（如 `EntityRandom`）。给了就用它当随机比例，
+///   不再用内部 PRNG —— 需要「每个实体一个皮肤」时用它（`EntityRandom` 对同一实体稳定）。
+/// - `shared`（可选）：`1` = 整个地图所有实例共用同一个结果（对应指南的 `$oneSkinPerMap`）。
+/// - `integer`（可选）：`1` = 结果向下取整。默认仍写浮点（`$frame` 这类着色器变量是浮点，
+///   取整只是为了落在整数帧上）。
+/// - `write_int`（可选）：`1` = 用 `set_int` 写出（目标是真正的整型变量时用）。
+pub struct RandomProxy {
+    min: NumParam,
+    max: NumParam,
+    result: String,
+    gate: String,
+    trigger: String,
+    seed: String,
+    unit_var: String,
+    integer: bool,
+    write_int: bool,
+    /// `$oneSkinPerMap` 语义：整个地图所有实例共用同一个随机结果
+    shared: String,
+    shared_n: CString,
+    /// `shared` 写成字面量时直接定值；否则每帧读 `shared_n` 变量
+    shared_lit: Option<bool>,
+    result_n: CString,
+    gate_n: CString,
+    trigger_n: CString,
+    seed_n: CString,
+    unit_n: CString,
+    /// PRNG（`rand::rngs::StdRng`，ChaCha12）：`None` = 尚未播种
+    rng: Option<rand::rngs::StdRng>,
+    /// 重掷计数，作为播种熵的一部分（保证每次重掷都换一个种子）
+    reroll_count: u32,
+    /// 当前随机比例 `[0,1)`：重掷时更新，每帧按当前 `[min,max]` 重新缩放
+    unit: f32,
+    last_trigger: i32,
+    /// 上次写出的值，仅在 `debug_assertions` 下用于抑制重复日志
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    last_value: f32,
+    last_shared: bool,
+}
+impl Default for RandomProxy {
+    fn default() -> Self {
+        Self {
+            min: NumParam::new("0"),
+            max: NumParam::new("1"),
+            result: "$random_result".into(),
+            gate: String::new(),
+            trigger: String::new(),
+            seed: String::new(),
+            unit_var: String::new(),
+            integer: false,
+            write_int: false,
+            shared: String::new(),
+            shared_n: cstr_of(""),
+            shared_lit: None,
+            result_n: cstr_of("$random_result"),
+            gate_n: cstr_of(""),
+            trigger_n: cstr_of(""),
+            seed_n: cstr_of(""),
+            unit_n: cstr_of(""),
+            rng: None,
+            reroll_count: 0,
+            unit: 0.0,
+            last_trigger: 0,
+            last_value: f32::NEG_INFINITY,
+            last_shared: false,
+        }
+    }
+}
+impl RandomProxy {
+    /// 用 `seed` 播种 `rand::rngs::StdRng`（ChaCha12），并取一个 `[0,1)` 随机比例。
+    ///
+    /// 采用 `rand` 而非自写 PRNG：算法经过充分验证、无自研风险；
+    /// `StdRng` 是 `rand` 文档指定的「加密强度、跨版本稳定」选择。
+    fn seed_and_roll(&mut self, seed: u64) {
+        use rand::{RngExt, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        // `random::<f32>()` 落在 [0,1)
+        self.unit = rng.random::<f32>();
+        self.rng = Some(rng);
+    }
+}
+impl Proxy for RandomProxy {
+    fn apply_kv(&mut self, name: &str, value: &str) {
+        match name.to_ascii_lowercase().as_str() {
+            "min" | "min_var" | "from" | "low" => self.min.set(value),
+            "max" | "max_var" | "to" | "high" => self.max.set(value),
+            "result" | "result_var" | "output" | "target" => {
+                set_kv(&mut self.result, &mut self.result_n, value)
+            }
+            "gate" | "enable" | "enabled" | "when" | "ready" => {
+                set_kv(&mut self.gate, &mut self.gate_n, value)
+            }
+            "trigger" | "input" | "src" | "reroll" | "reroll_var" => {
+                set_kv(&mut self.trigger, &mut self.trigger_n, value)
+            }
+            "seed" | "seed_var" | "entropy" | "salt" => {
+                set_kv(&mut self.seed, &mut self.seed_n, value)
+            }
+            "unit" | "unit_var" | "source" | "random_source" => {
+                set_kv(&mut self.unit_var, &mut self.unit_n, value)
+            }
+            "integer" | "int" | "floor" => self.integer = kv_truthy(value),
+            "write_int" | "as_int" | "set_int" => self.write_int = kv_truthy(value),
+            "shared" | "one_skin_per_map" | "global" | "same_for_all" => {
+                // 允许写字面量（"1"）或变量名（"$oneSkinPerMap"）
+                self.shared_lit = if value.trim().starts_with('$') {
+                    None
+                } else {
+                    Some(kv_truthy(value))
+                };
+                set_kv(&mut self.shared, &mut self.shared_n, value);
+            }
+            _ => {}
+        }
+    }
+    // 触发器/上下界都可能每帧变化
+    fn per_frame(&self) -> bool {
+        true
+    }
+    unsafe fn bind(&mut self, material: *mut c_void) -> Result<(), PluginError> {
+        if material.is_null() {
+            return Err(PluginError::Material(MaterialError::InvalidMaterial));
+        }
+        let out = material::find_var(material, &self.result_n)?;
+
+        // 门控：为 0 时完全不动作（保持上一次写出的值，避免加载瞬间连跳几帧）
+        if !self.gate.is_empty() {
+            match read_number(material, &self.gate_n) {
+                Some(g) if g != 0.0 => {}
+                _ => return Ok(()),
+            }
+        }
+
+        // `shared` 可以是字面量或变量名；变量为 0 时按每实例随机
+        let shared = match self.shared_lit {
+            Some(v) => v,
+            None if self.shared.is_empty() => false,
+            None => read_number(material, &self.shared_n).unwrap_or(0.0) != 0.0,
+        };
+
+        // 随机比例：给了 `unit` 就用外部随机源（如 EntityRandom，对同一实体稳定），
+        // 否则用内部 PRNG —— 首次 bind（rng == None）必然播种一次，之后仅在 trigger 变化时重掷。
+        if !self.unit_var.is_empty() {
+            let u = read_number(material, &self.unit_n).unwrap_or(0.0);
+            self.unit = if u.is_finite() { u.clamp(0.0, 1.0) } else { 0.0 };
+        }
+        else {
+            let mut reroll = self.rng.is_none();
+            if !self.trigger.is_empty() {
+                if let Some(t) = read_number(material, &self.trigger_n) {
+                    let t = t as i32;
+                    if t != self.last_trigger {
+                        reroll = true;
+                        self.last_trigger = t;
+                    }
+                }
+            }
+            // shared 打开/关闭时也要重掷，否则切换开关不生效
+            if shared != self.last_shared {
+                reroll = true;
+                self.last_shared = shared;
+            }
+            if reroll {
+                let extra = if self.seed.is_empty() {
+                    0
+                }
+                else {
+                    read_number(material, &self.seed_n).unwrap_or(0.0).to_bits()
+                };
+                self.reroll_count = self.reroll_count.wrapping_add(1);
+                let seed = reseed(material, extra, self.reroll_count, shared);
+                self.seed_and_roll(seed);
+            }
+        }
+
+        let mut lo = self.min.resolve(material, 0.0);
+        let mut hi = self.max.resolve(material, 1.0);
+        if !lo.is_finite() {
+            lo = 0.0;
+        }
+        if !hi.is_finite() {
+            hi = 1.0;
+        }
+        if hi < lo {
+            core::mem::swap(&mut lo, &mut hi);
+        }
+        let v = scale_unit(self.unit, lo, hi, self.integer);
+        if self.write_int {
+            material::set_int(out, v as i32)?;
+        }
+        else {
+            material::set_float(out, v)?;
+        }
+        #[cfg(debug_assertions)]
+        {
+            if (v - self.last_value).abs() > EPS {
+                let mat_name = material::get_name(material).unwrap_or_else(|_| "?".into());
+                log(&format!(
+                    "random[{}]: {}={v} in [{lo}, {hi}] (unit={})",
+                    mat_name, self.result, self.unit
+                ));
+                self.last_value = v;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_unit_maps_range() {
+        // unit=0 → lo；unit 接近 1 → 接近 hi
+        assert_eq!(scale_unit(0.0, 5.0, 10.0, false), 5.0);
+        assert_eq!(scale_unit(0.5, 0.0, 10.0, false), 5.0);
+        assert_eq!(scale_unit(0.25, 0.0, 4.0, false), 1.0);
+        // integer = 向下取整（$frame 必须落在整数帧上）
+        assert_eq!(scale_unit(0.99, 0.0, 4.0, true), 3.0);
+        assert_eq!(scale_unit(0.5, 0.0, 4.0, true), 2.0);
+        // 负区间同样成立
+        assert_eq!(scale_unit(0.5, -10.0, 10.0, false), 0.0);
+    }
+
+    #[test]
+    fn kv_truthy_accepts_common_spellings() {
+        for s in ["1", "true", "TRUE", "yes", "On", " 1 "] {
+            assert!(kv_truthy(s), "{s} 应为真");
+        }
+        for s in ["0", "false", "no", "off", "", "$var"] {
+            assert!(!kv_truthy(s), "{s} 应为假");
+        }
+    }
+
+    #[test]
+    fn num_param_accepts_literal_or_variable() {
+        // 字面量：直接定值，不需要材质
+        let lit = NumParam::new("42");
+        assert_eq!(lit.lit, Some(42.0));
+        // 变量名：无法解析成数字 → 留给 find_var（此处只验证解析结果）
+        let var = NumParam::new("$frameLimit");
+        assert_eq!(var.lit, None);
+        assert_eq!(var.name, "$frameLimit");
+        // 覆盖 set 会同时更新字面量与缓存名
+        let mut p = NumParam::new("0");
+        p.set("$max_frame");
+        assert_eq!(p.lit, None);
+        assert_eq!(p.name, "$max_frame");
+    }
+
+    #[test]
+    fn seeded_rng_is_deterministic_and_in_range() {
+        // 同一种子必须给出同一序列（保证帧间稳定）
+        let mut a = RandomProxy::default();
+        a.seed_and_roll(0x1234_5678);
+        let mut b = RandomProxy::default();
+        b.seed_and_roll(0x1234_5678);
+        assert_eq!(a.unit, b.unit, "同种子应得到同一随机比例");
+
+        // 不同种子应给出不同比例（抽样验证，避免偶然相等造成假阴性）
+        let mut c = RandomProxy::default();
+        c.seed_and_roll(0x8765_4321);
+        assert_ne!(a.unit, c.unit, "不同种子不应得到同一比例");
+
+        // [0,1) 映射恒在范围内
+        let mut p = RandomProxy::default();
+        for i in 0..1000u64 {
+            p.seed_and_roll(i);
+            assert!((0.0..1.0).contains(&p.unit), "unit={} 越界", p.unit);
+        }
+        assert!(p.rng.is_some(), "播种后应持有 PRNG");
+    }
+
+    #[test]
+    fn reseed_is_nonzero_and_differs_per_instance() {
+        let m1 = 0x1000usize as *mut c_void;
+        let m2 = 0x2000usize as *mut c_void;
+        let s1 = reseed(m1, 0, 1, false);
+        let s2 = reseed(m2, 0, 1, false);
+        // 不同材质实例应当拿到不同种子（静态物体也能各自随机）
+        assert_ne!(s1, s2, "不同实例的种子不应相同");
+        // 同一实例连续重掷也应换种子（否则 trigger 重掷无效）
+        assert_ne!(s1, reseed(m1, 0, 2, false), "重掷应换种子");
+        // shared 模式下同一进程内恒定 → 所有实例共用同一结果
+        assert_eq!(reseed(m1, 0, 1, true), reseed(m2, 0, 99, true));
+        // 且与实例无关、与计数无关（换地图才换皮肤）
+        assert_eq!(reseed(m1, 7, 1, true), reseed(m2, 0, 5, true));
+        assert_eq!(shared_salt(), shared_salt());
+    }
+
+    #[test]
+    fn apply_kv_parses_documented_parameters() {
+        let mut p = RandomProxy::default();
+        p.apply_kv("MIN", "$frameLimit");
+        p.apply_kv("max", "8");
+        p.apply_kv("result", "$frame");
+        p.apply_kv("integer", "1");
+        p.apply_kv("shared", "$oneSkinPerMap");
+        p.apply_kv("unknown_key", "whatever"); // 未知名应被忽略
+        assert_eq!(p.min.name, "$frameLimit");
+        assert_eq!(p.min.lit, None);
+        assert_eq!(p.max.lit, Some(8.0));
+        assert_eq!(p.result, "$frame");
+        assert!(p.integer);
+        assert_eq!(p.shared_lit, None, "以 $ 开头应视为变量名");
+        assert_eq!(p.shared, "$oneSkinPerMap");
+
+        // 字面量 shared 直接定值
+        let mut q = RandomProxy::default();
+        q.apply_kv("shared", "1");
+        assert_eq!(q.shared_lit, Some(true));
+
+        // unit 参数
+        let mut r = RandomProxy::default();
+        r.apply_kv("unit", "$entityUnit");
+        assert_eq!(r.unit_var, "$entityUnit");
+    }
+}

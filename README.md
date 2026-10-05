@@ -4,7 +4,29 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 
 本插件实现了 **L4N 插件接口 v2**（`IL4NPlugin`），除材质代理外还提供一个 **HUD 菜单入口**（见[游戏内 HUD 菜单](#游戏内-hud-菜单)）。
 
-对于添加的材质代理详情，见[`Example.vmt`](/Example.vmt)。
+对于添加的材质代理详情，见 [`Example.vmt`](Example.vmt)。
+
+## 示例文件
+
+| 文件 | 说明 |
+|---|---|
+| [`Example.vmt`](Example.vmt) | 全部内置代理的参数用法演示 |
+| [`Example_RNG.vmt`](Example_RNG.vmt) | **随机皮肤**：改写自 Steam 指南 [RNG in 10 seconds (for modders)](https://steamcommunity.com/sharedfiles/filedetails/?id=2389582650) 的 ⚪️ 版，指南里约 40 个代理 → `l4nrp_random` 1 个 |
+| [`Example_RNG_Map.vmt`](Example_RNG_Map.vmt) | 同上 🔶 版（地图静态物件 / 按玩家位置换皮肤） |
+| [`Example_RNG_Entity.vmt`](Example_RNG_Entity.vmt) | 同上 🔵 版（幸存者等实体，尸体与生前皮肤一致） |
+
+### 随机皮肤：指南原版 vs 本插件
+
+Steam 指南 [RNG in 10 seconds](https://steamcommunity.com/sharedfiles/filedetails/?id=2389582650) 用 `AnimatedTexture` 数出 VTF 的帧数，再用 `CurrentTime` / `EntityRandom` / `PlayerProximity` / `ConVar` 等十几个引擎代理做溢出钳制与重掷，中间变量三十多个。本插件提供 `l4nrp_random`，把「随机」那部分整体替换为一个代理：
+
+| 环节 | 指南原版 | 本插件 |
+|---|---|---|
+| 帧数探测 | `AnimatedTexture` + `LessOrEqual` | **保留**（只有它能数出 VTF 有几帧） |
+| 随机 | `EntityRandom` + `CurrentTime` + `PlayerProximity` | `l4nrp_random` |
+| 溢出钳制 | `Subtract`/`LessOrEqual` 绕一圈夹进 `[0,帧数)` | `min`/`max` 直接缩放 |
+| 重掷信号 | `ConVar` 读 `cl_buy_favorite_nowarn` | `trigger`（可选） |
+| 每地图固定一个皮肤 | `$prepareStore`/`$randSYSStored`/`$randSYSInject` 三变量比对 | `shared`（可选） |
+| 静态物件（地图道具） | 必须换用 🔶 版，否则加载即崩溃 | 无需换文件（不依赖实体） |
 
 ## 安装
 
@@ -96,6 +118,7 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 | `l4nrp_vec3` | `src_x`→`$src_x`、`src_y`→`$src_y`、`src_z`→`$src_z`、`result`→`$result_var` | 把 3 个浮点变量作为分量组成三维向量写入 result（每帧） |
 | `l4nrp_math` | `expr`→`"0"`、`result`→`$result_var` | 计算数学表达式（四则/幂/括号/函数；`$var` 或 `var` 读材质已定义变量），结果写入 result（每帧） |
 | `l4nrp_logic` | `expr`→`"0"`、`result`→`$result_var` | 计算逻辑表达式（比较 `== != < <= > >=` 与逻辑 `&& \|\| !`，非 0 视为真；另有 `in_range`/`in_range_exclusively` 范围函数），结果写 result（整型 0/1，每帧） |
+| `l4nrp_random` | `min`→`0`、`max`→`1`、`result`→`$random_result`；可选 `gate`、`trigger`、`seed`、`unit`、`shared`、`integer`、`write_int` | 稳定的伪随机数：按材质实例播种一次（**静态物体也能用**），把 `[0,1)` 比例缩放到 `[min,max]` 写入 result（每帧） |
 | `l4nrp_delay_set` | `trigger`→`$trigger_var`、`delay`→`1000`、`output`→`$result_var`、`value`→`$value_var`、`handle`→""（可选） | 检测 trigger（整型）非 0 上升沿后启动计时器，延迟 delay 毫秒把 value 变量的整型值**触发时快照**写入 output（延迟期间 value 变化不影响本次输出）；handle 写出 UUID v4 计时器手柄（字符串类型，无计时器写空字符串，每帧） |
 | `l4nrp_delay_abort` | `trigger`→`$trigger_var`、`handle`→`$timer_handle` | trigger 非 0 时中断 handle 变量指定的计时器（每帧） |
 | `l4nrp_print_variable` | `var`→`$var`、`type`→`float`（`float`/`int`/`vector`/`string`） | 每帧读取变量并打印 |
@@ -104,6 +127,8 @@ L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。�
 
 - 代理只能读写**已在 VMT 声明**的变量（引擎只为声明过的变量创建变量对象）。若想让代理写入某个变量，请先在 VMT 顶层声明它，例如 `"$result_var" "0"`。
 - 插件与**原版/L4N 内置材质代理共存**：同一个 `"Proxies"` 块里 `Sine`/`Multiply`/`Sequence`（L4N的材质代理） 与 `l4nrp_*`可同时使用。
+- `l4nrp_random` 的 `min`/`max`/`shared` 既可以写字面量（`"0"`）也可以写变量名（`"$frameLimit"`）；其它代理的 `min`/`max` 一律按变量名处理。
+- `l4nrp_math` 与 `l4nrp_logic` 的表达式里，`$var` 与 `var` 等价；未声明的变量按 `0` 处理（不报错）。
 
 ## 游戏内 HUD 菜单
 

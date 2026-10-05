@@ -1,0 +1,137 @@
+// =====================================================================
+// Example_RNG.vmt —— 随机皮肤（RNG skin）示例
+//
+// 改写自 Steam 指南 "RNG in 10 seconds (for modders)" by Ellie
+//   https://steamcommunity.com/sharedfiles/filedetails/?id=2389582650
+//   对应指南的 ⚪️ "RNG Pure 2020 (inline)"
+//
+// 指南原版要用 AnimatedTexture 数出帧数，再用 CurrentTime / EntityRandom /
+// PlayerProximity / ConVar 等十几个引擎代理做溢出钳制与重掷，光中间变量就
+// 三十多个。本文件把「随机」那部分整体换成一行 l4nrp_random。
+//
+// ---------------------------------------------------------------------
+// 原版 vs 本插件
+// ---------------------------------------------------------------------
+//   帧数探测     保留（AnimatedTexture + LessOrEqual）—— 只有它能数出
+//                "这个 VTF 有几帧"，插件无法替代；
+//   随机         指南 ~40 个代理 → l4nrp_random 1 个；
+//   溢出钳制     指南用 Subtract/LessOrEqual 绕一圈把随机值夹进 [0,帧数)
+//                → l4nrp_random 的 min/max 直接缩放；
+//   重掷         指南靠 ConVar 读 cl_buy_favorite_nowarn 做信号
+//                → l4nrp_random 的 trigger（可选）；
+//   每地图固定   指南用 $prepareStore/$randSYSStored/$randSYSInject 三变量比对
+//                → l4nrp_random 的 shared（可选）；
+//   静态物体     指南必须改用 🔶 版本（EntityRandom 对不动的物体无效）
+//                → 本版本对静态物体同样有效，无需换文件。
+//
+// ---------------------------------------------------------------------
+// 用法
+// ---------------------------------------------------------------------
+//   1. 准备一个多帧 VTF（每帧一个皮肤，见指南 STEP 1）；
+//   2. 把 $basetexture 换成你的 VTF；
+//   3. 需要每实体一个皮肤（幸存者/武器）请看 Example_RNG_Entity.vmt，
+//      需要按玩家位置变化请看 Example_RNG_Map.vmt。
+//
+// 注意：$frame 必须是**已在 VMT 声明**的变量，l4nrp_random 才能写进去。
+// =====================================================================
+VertexLitGeneric
+{
+    "$basetexture" "models/weapons/v_models/your_multiframe_texture"
+
+    // ---------- 可调参数 ----------
+    // "1" = 整张地图只随机一次（对应指南 $oneSkinPerMap）
+    "$oneSkinPerMap" "0"
+    // "1" = 这个 VTF 里有一帧是全透明的，把它也算作一个皮肤
+    //（对应指南 $invisibleIsAlsoASkinHere）
+    "$invisibleIsAlsoASkinHere" "0"
+
+    // ---------- 帧数探测所需的变量 ----------
+    "$checkMax"        "0.0" // AnimatedTexture 把当前帧号写在这里
+    "$maxFrame"        "0.0" // 探测到的最大帧号（= 帧数 - 1）
+    "$maxFramePlusOne" "1.0" // = 帧数
+    "$countingFinished" "0.0" // 1 = 已经数完一轮
+    "$zero" "0.0"
+    "$one"  "1.0"
+
+    // ---------- l4nrp_random 的输入 / 输出 ----------
+    "$frameLimit" "1.0" // 随机上界 = 帧数（下面 Add 算出）
+    "$frame"      "0.0" // 输出：着色器读的帧号
+
+    "Proxies"
+    {
+        // =============================================================
+        // 1) 帧数探测（保留指南原样）
+        // =============================================================
+
+        // 把每帧的 $checkMax 累积进 $maxFrame，取到最大值
+        // LessOrEqual 语义：srcVar1 <= srcVar2 ? LessEqualVar : greaterVar
+        LessOrEqual
+        {
+            LessEqualVar "$maxFrame"    // checkMax <= maxFrame 时保持不变
+            greaterVar   "$checkMax"    // 否则取新的更大值
+            srcVar1      "$checkMax"
+            srcVar2      "$maxFrame"
+            resultVar    "$maxFrame"
+        }
+        // $checkMax 归零 → 说明动画走完了一轮
+        LessOrEqual
+        {
+            LessEqualVar "$one"
+            greaterVar   "$countingFinished"
+            srcVar1      "$checkMax"
+            srcVar2      "$zero"
+            resultVar    "$countingFinished"
+        }
+        // 但一帧都没数到就不算数
+        LessOrEqual
+        {
+            LessEqualVar "$zero"
+            greaterVar   "$countingFinished"
+            srcVar1      "$maxFrame"
+            srcVar2      "$zero"
+            resultVar    "$countingFinished"
+        }
+        // 帧数 = 最大帧号 + 1
+        Add
+        {
+            srcVar1  "$maxFrame"
+            srcVar2  "$one"
+            resultVar "$maxFramePlusOne"
+        }
+        // 若隐形帧也算皮肤，上界再 +1
+        Add
+        {
+            srcVar1  "$invisibleIsAlsoASkinHere"
+            srcVar2  "$maxFramePlusOne"
+            resultVar "$frameLimit"
+        }
+
+        // 驱动帧号（必须保留，否则 $checkMax 不会变）
+        AnimatedTexture
+        {
+            animatedtexturevar         "$basetexture"
+            animatedtextureframenumvar "$checkMax"
+            animatedtextureframerate   "25"
+        }
+
+        // =============================================================
+        // 2) 随机皮肤 —— 指南的整个 RNG 部分，替换为下面这一个代理
+        //
+        //    min/max  字面量或变量名都行；max 用 $frameLimit，所以帧数
+        //             探测完成后结果自动落在 [0, 帧数) 内；
+        //    integer  "1" = 落在整数帧上；
+        //    gate     接 $countingFinished：数完帧才开始随机，
+        //             避免加载瞬间连跳几帧；
+        //    shared   接 $oneSkinPerMap："1" 时整张地图共用一个皮肤。
+        // =============================================================
+        l4nrp_random
+        {
+            min     "0"
+            max     "$frameLimit"
+            result  "$frame"
+            gate    "$countingFinished"
+            integer "1"
+            shared  "$oneSkinPerMap"
+        }
+    }
+}

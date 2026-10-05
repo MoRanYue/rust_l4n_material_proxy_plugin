@@ -147,6 +147,7 @@ unsafe fn try_bind_and_install() -> Result<(), PluginError> {
     material::register_proxy::<Vec3Proxy>("l4nrp_vec3");
     material::register_proxy::<MathProxy>("l4nrp_math");
     material::register_proxy::<LogicProxy>("l4nrp_logic");
+    material::register_proxy::<RandomProxy>("l4nrp_random");
     material::register_proxy::<DelaySetProxy>("l4nrp_delay_set");
     material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
     log(&format!(

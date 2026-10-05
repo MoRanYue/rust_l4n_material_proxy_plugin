@@ -361,6 +361,8 @@ impl Parser<'_> {
             "ceil" => one(f32::ceil),
             "round" => one(f32::round),
             "sign" => one(|x| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }),
+            // 小数部分（引擎 Frac 代理的等价物，RNG 改写常用）
+            "frac" => one(|x| x - x.floor()),
             "min" => two(f32::min),
             "max" => two(f32::max),
             "clamp" => {
@@ -448,6 +450,16 @@ mod tests {
         assert_eq!(math("(1 + 2) * 3").unwrap(), 9.0);
         assert_eq!(math("2 ^ 3 ^ 2").unwrap(), 512.0);
         assert_eq!(math("min($a, $b) + max(1, 2)").unwrap(), 5.0);
+    }
+
+    #[test]
+    fn math_frac() {
+        // 引擎 Frac 代理的等价物：小数部分
+        assert_eq!(math("frac(1.25)").unwrap(), 0.25);
+        assert_eq!(math("frac(-1.25)").unwrap(), 0.75);
+        assert_eq!(math("frac(3)").unwrap(), 0.0);
+        // RNG 改写里的典型用法：把坐标揉成 [0,1)
+        assert_eq!(math("frac((abs(-7) + abs(3)) / 4)").unwrap(), 0.5);
     }
 
     #[test]

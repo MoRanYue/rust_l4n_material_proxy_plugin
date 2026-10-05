@@ -170,6 +170,15 @@ materialsystem.dll `FUN_10002d50`（RVA `0x2d50`）是引擎解析 VMT `"Proxies
 
 > `FindVar` 只对**已在 VMT 声明**的变量有效（引擎只为声明过的变量创建 `IMaterialVar`）。
 
+> **`SetFloatValue` / `SetIntValue` 会同时同步两个字段**（字节级实测，`materialsystem.dll`）：
+> `SetFloatValue`(+0x0c) 在 `MOVSS [this+0x0c], XMM0` 之后执行 `CVTTSS2SI` 并把整数写进
+> `[this+0x08]`；`SetIntValue`(+0x10) 在 `MOV [this+0x08], EDI` 之后执行 `CVTSI2SS` 并把浮点写进
+> `[this+0x0c]`（`GetIntValue`(+0x68) 读 `[this+0x08]`、`GetFloatValue`(+0x6c) 读 `[this+0x0c]`，
+> 二者都不做类型转换）。
+> **实践含义**：VMT 里写 `"0"`（整型）还是 `"0.0"`（浮点）**都不影响 `get_float` 读取**，
+> 变量类型只在「按字符串读」时才有区别。`l4nrp_random` 的 `read_number` 因此以
+> `get_float` 为主、`get_int` 仅作异常兜底。
+
 ## 每帧执行（D3D9 EndScene hook）
 
 原版代理每帧 `OnBind`，而我们的代理若只在材质加载时触发一次，对依赖每帧输入的持续计算会"无效"。
@@ -272,6 +281,7 @@ material::register_proxy::<StrLenProxy>("l4nrp_str_len");
 material::register_proxy::<VmtName>("l4nrp_vmt_name");
 material::register_proxy::<MathProxy>("l4nrp_math");
 material::register_proxy::<LogicProxy>("l4nrp_logic");
+material::register_proxy::<RandomProxy>("l4nrp_random");
 material::register_proxy::<Vec3Proxy>("l4nrp_vec3");
 material::register_proxy::<DelaySetProxy>("l4nrp_delay_set");
 material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
@@ -322,14 +332,29 @@ material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
 > **`l4nrp_delay_abort` 中断计时器**：`trigger`（整型，`get_int`）非 0 时，读取 `handle` 变量
 > （字符串类型，`get_string`）指定的 UUID 手柄并调用 `material::abort_timer` 中断对应计时器
 > （幂等，无该计时器则无操作）。
+>
+> **`l4nrp_random` 随机数**：把 `[0,1)` 随机比例缩放到 `[min,max]` 写入 `result`（每帧）。
+> `min`/`max`/`shared` **既可写字面量也可写变量名**（其它代理的 `min`/`max` 一律按变量名）；
+> 其余参数：`gate`（0 时不动作）、`trigger`（整型，值变化时重掷）、`seed`（额外熵）、
+> `unit`（外部 `[0,1)` 随机源，如 `EntityRandom`，给了就不走内部 PRNG）、
+> `integer`（结果向下取整）、`write_int`（用 `set_int` 写出）。
+> PRNG 用 **`rand` crate 的 `rand::rngs::StdRng`**（ChaCha12，`seed_from_u64` 播种），
+> 种子由 `reseed()` 混合系统时间 + 材质实例地址（仅当熵用，不解引用）+ `seed` 变量 + 重掷计数。
+> **`shared` 语义（对应指南的 `$oneSkinPerMap`）**：`reseed` 在 shared 模式下**只用进程级
+> `shared_salt()`**（`OnceLock` 取一次系统时间），不掺时间/地址/计数/额外熵 —— 否则先重掷与
+> 后重掷的实例会分叉。因此同一进程内所有实例、任何时刻重掷都得到同一皮肤。
+> 与引擎 `EntityRandom` 的差异：**静态物体也能用**（不依赖实体）、帧间稳定（不每帧乱跳）、
+> `min`/`max` 每帧重读（上界变大时结果按比例跟随，省掉原版 RNG 那一长串溢出/钳制代理）。
 
 - **CString 缓存**：`per_frame` 代理在 struct 里缓存变量名 `CString`（`cstr_of` 构造），避免每帧
   反复堆分配；`apply_kv` 更新变量名时用辅助函数 `set_kv(&mut dst, &mut c, value)` 同步重建缓存
   （位于 [`src/lib.rs`](src/lib.rs)，可复用）。
 - 代理见 [`src/lib.rs`](src/lib.rs)：`DoesEqualProxy` / `CompareProxy` / `IsInRangeProxy` /
   `PrintVariable` / `StrConcatProxy` / `StrReplaceProxy` / `StrSliceProxy` / `StrLenProxy` / `VmtName` /
-  `MathProxy` / `LogicProxy` / `Vec3Proxy` / `DelaySetProxy` / `DelayAbortProxy`。
-- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 14 个代理及其参数）。
+  `MathProxy` / `LogicProxy` / `RandomProxy` / `Vec3Proxy` / `DelaySetProxy` / `DelayAbortProxy`。
+- 完整 VMT 用法示例见项目根目录 [`Example.vmt`](Example.vmt)（涵盖全部 15 个代理及其参数）；
+  随机皮肤的三份改写示例见 [`Example_RNG.vmt`](Example_RNG.vmt) / [`Example_RNG_Map.vmt`](Example_RNG_Map.vmt) /
+  [`Example_RNG_Entity.vmt`](Example_RNG_Entity.vmt)。
 
 ## 构建 / 部署 / 验证
 
