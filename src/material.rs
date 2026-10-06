@@ -1,22 +1,20 @@
-﻿#![allow(dead_code)] // set_int/set_string 等 API 供插件开发者选用
+#![allow(dead_code)] // set_int/set_string 等 API 供插件开发者选用
 //! 材质代理：代理注册表、KeyValues 解析、detour hook、D3D EndScene 每帧执行。
 //! 详细机制 / 逆向依据 / 注意事项见项目根目录 AGENTS.md。
 
 use core::ffi::{c_char, c_void, CStr};
 use core::mem::transmute;
-use core::ptr::with_exposed_provenance;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::LazyLock;
 use std::time::Instant;
 
 use uuid::Uuid;
-use windows::Win32::Foundation::GetLastError;
 use windows::core::s;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
-use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualProtect};
+use windows::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
 
 use crate::error::{MaterialError, PluginError};
 use crate::kv::Proxy;
@@ -294,43 +292,265 @@ pub fn registered_names() -> Vec<String> {
     REGISTRY.lock().unwrap().iter().map(|e| e.name.to_string()).collect()
 }
 
+// ---------- 引擎侧代理对象（真正注册进 CMaterialProxyDict 的 IMaterialProxy） ----------
+// 逆向依据（详见 AGENTS.md「引擎原生代理注册」）：
+//   * `client.dll` 的 `CMaterialProxyDict`（vtable RVA 0x576d94）只有 3 个槽位：
+//     `[0]` CreateProxy、`[1]` DeleteProxy、`[2]` AddProxy；
+//   * `materialsystem.dll` 的 VMT 解析函数 `FUN_10002d50` 遍历 `"Proxies"` 子键，
+//     对每个键调用 `CreateProxy(名字)`，成功后调用 `Init(IMaterial*, KeyValues*)`；
+//     只有 `Init` 返回 false 才调用 `DeleteProxy` 回收；
+//   * 材质卸载时引擎调用 `Release()`（`AnimatedTexture::Release` 即自调 `vtable[0x10](1)` 自删）。
+// 因此本插件把自己注册成引擎原生代理，不再 detour 引擎解析函数，也不再从
+// `"Proxies"` 块里摘除节点 —— 引擎自己会实例化并驱动我们。
+//
+// vtable 形状对齐 `AnimatedTexture`（client.dll RVA 0x53cb48，7 槽）的前 5 槽；
+// 实测（探针 v5）5 槽即可被引擎正常驱动：Init / OnBind / Release / GetMaterial / 标量删除析构。
+
+#[repr(C)]
+struct ProxyVtable {
+    init: unsafe extern "thiscall" fn(*mut ProxyObject, *mut c_void, *mut c_void) -> u8,
+    on_bind: unsafe extern "thiscall" fn(*mut ProxyObject, *mut c_void),
+    release: unsafe extern "thiscall" fn(*mut ProxyObject),
+    get_material: unsafe extern "thiscall" fn(*mut ProxyObject) -> *mut c_void,
+    scalar_deleting_dtor: unsafe extern "thiscall" fn(*mut ProxyObject, u32),
+}
+
+/// 交给引擎的 `IMaterialProxy` 实例（每个 VMT 代理实例一个）。
+///
+/// 由 `l4nrp_create`（`extern "C" fn() -> *mut c_void`）用 Rust 堆分配；引擎只使用首字段的
+/// vtable 指针并调用虚函数，`proxy` 里装着真正的计算逻辑。
+/// 生命周期：`Release()` 只置 `released` 标记，由 `run_active_proxies` 每帧
+/// `purge_released` 统一回收（先摘 `ACTIVE` 再 `Box::from_raw`，避免悬垂）。
+#[repr(C)]
+struct ProxyObject {
+    vtable: *const ProxyVtable,
+    material: *mut c_void,
+    /// 引擎已调用 `Release()`。
+    released: AtomicBool,
+    /// 本对象的代理实例；注册表未命中时保持 `None`（空转但不崩）。
+    proxy: Option<Box<dyn Proxy>>,
+}
+// 对象在渲染线程创建、材质卸载时（主线程）Release，指针仅在裸指针语义下传递
+unsafe impl Send for ProxyObject {}
+
+/// 所有存活对象的登记表（用于每帧回收已 `Release` 的对象）。
+struct LiveList(Vec<*mut ProxyObject>);
+unsafe impl Send for LiveList {}
+static LIVE: Mutex<LiveList> = Mutex::new(LiveList(Vec::new()));
+
+static PROXY_VTABLE: ProxyVtable = ProxyVtable {
+    init: po_init,
+    on_bind: po_on_bind,
+    release: po_release,
+    get_material: po_get_material,
+    scalar_deleting_dtor: po_scalar_deleting_dtor,
+};
+
+/// 引擎 `CMaterialProxyDict` 的 createFn：无参，返回新建的代理对象（失败返回空）。
+///
+/// 用 Rust 堆分配（而非 client.dll 的 `operator new`）：分配与释放两端都在本插件手里
+/// （`l4nrp_create` / `purge_released`），不存在跨分配器不匹配。
+unsafe extern "C" fn l4nrp_create() -> *mut c_void {
+    let obj = Box::new(ProxyObject {
+        vtable: &raw const PROXY_VTABLE,
+        material: core::ptr::null_mut(),
+        released: AtomicBool::new(false),
+        proxy: None,
+    });
+    let p = Box::into_raw(obj);
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).0.push(p);
+    p.cast::<c_void>()
+}
+
+/// 从 KeyValues 节点取键名（引擎 `GetKeyName`，materialsystem RVA 0x75b90）。
+/// 引擎传给 `Init` 的 `kv` 就是该代理自己的节点，其键名即代理名。
+unsafe fn kv_key_name(node: *mut c_void) -> Option<String> {
+    let get_name_p = ms_fn(0x75b90);
+    if get_name_p.is_null() || node.is_null() {
+        return None;
+    }
+    let get_name: GetKeyNameFn = transmute(get_name_p);
+    let p = get_name(node);
+    if p.is_null() {
+        return None;
+    }
+    Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+}
+
+unsafe extern "thiscall" fn po_init(
+    this: *mut ProxyObject,
+    material: *mut c_void,
+    kv: *mut c_void,
+) -> u8 {
+    if this.is_null() {
+        return 1;
+    }
+    (*this).material = material;
+    let name = kv_key_name(kv).unwrap_or_default();
+    // 先在锁内取出构造器，再释放锁（构造过程会碰 KeyValues / 材质变量，不宜持锁）
+    let new_proxy = {
+        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        reg.iter().find(|e| e.name == name).map(|e| e.new_proxy)
+    };
+    let Some(new_proxy) = new_proxy else {
+        // 不在注册表里（理论上不会发生）：接受但空转，避免引擎走 DeleteProxy 释放路径
+        crate::log(&format!("engine proxy: '{name}' not in registry, accepted as no-op"));
+        return 1;
+    };
+    let mut proxy = new_proxy();
+    parse_proxy_params(&mut *proxy, kv);
+    let per_frame = proxy.per_frame();
+    let bind_err = proxy.bind(material).err();
+    (*this).proxy = Some(proxy);
+    crate::log(&format!(
+        "engine proxy: '{name}' Init material=0x{:x} per_frame={per_frame}",
+        material.addr()
+    ));
+    if let Some(e) = bind_err {
+        crate::log(&format!("engine proxy: '{name}' initial bind failed: {e}"));
+    }
+    if per_frame {
+        register_active(this, material);
+    }
+    1
+}
+
+/// 引擎在材质每次绑定时调用。本插件仍在 D3D `EndScene` 里驱动 per-frame 代理
+/// （`l4nrp_delay_set` 的计时器需要每帧心跳，不能只在材质被渲染时才跑），故此处空转。
+unsafe extern "thiscall" fn po_on_bind(_this: *mut ProxyObject, _entity: *mut c_void) {
+    // 刻意留空：per-frame 代理仍由 D3D `EndScene` hook 驱动（见 `run_active_proxies`），
+    // `l4nrp_delay_set` 的计时器依赖那个每帧心跳。引擎只在材质 bind 时调本槽，
+    // 用它驱动会漏帧，故不在此处执行 bind。
+}
+
+/// 引擎在材质卸载时调用：只打标记，实际回收交给 `run_active_proxies`（见 `ProxyObject`）。
+unsafe extern "thiscall" fn po_release(this: *mut ProxyObject) {
+    if this.is_null() {
+        return;
+    }
+    if !(*this).released.swap(true, Ordering::AcqRel) {
+        crate::log("engine proxy: Release");
+    }
+}
+
+unsafe extern "thiscall" fn po_get_material(this: *mut ProxyObject) -> *mut c_void {
+    if this.is_null() {
+        core::ptr::null_mut()
+    }
+    else {
+        (*this).material
+    }
+}
+
+/// 标量删除析构：引擎正常路径不会调用（我们总是让 `Init` 返回 true），
+/// 真被调用时同样只打标记，交给每帧回收，避免二次释放。
+unsafe extern "thiscall" fn po_scalar_deleting_dtor(this: *mut ProxyObject, _flags: u32) {
+    po_release(this);
+}
+
+/// 把所有已注册代理登记进 `client.dll` 的 `CMaterialProxyDict`，返回登记个数。
+///
+/// 代理名用 `Box::leak` 永久持有：`AddProxy` 是否复制名字未经验证，
+/// 泄漏十几个短字符串换取「绝不悬垂」。
+///
+/// # Safety
+/// 必须在 `client.dll` 已加载后调用（`OnModuleLoaded("client")`）。
+pub unsafe fn register_engine_proxies() -> Result<usize, PluginError> {
+    let factory = crate::engine::material_proxy_factory()?;
+    let names: Vec<&'static str> = {
+        let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        reg.iter().map(|e| e.name).collect()
+    };
+    let create_fn = (l4nrp_create as *const ()).cast::<c_void>();
+    let mut n = 0usize;
+    for name in names {
+        let Ok(cname) = CString::new(name) else {
+            crate::log(&format!("engine proxy: '{name}' contains NUL, skipped"));
+            continue;
+        };
+        let leaked: &'static CStr = Box::leak(cname.into_boxed_c_str());
+        match crate::engine::add_material_proxy(factory, leaked, create_fn) {
+            Ok(()) => n += 1,
+            Err(e) => crate::log(&format!("engine proxy: AddProxy('{name}') failed: {e}")),
+        }
+    }
+    Ok(n)
+}
+
 // ---------- 每帧执行（D3D EndScene 触发） ----------
 struct ActiveProxy {
     // 唯一 id：同一材质可注册多个 per-frame 代理（各自独立条目，参数隔离）
     id: u64,
+    /// 拥有该条目的引擎侧代理对象（`l4nrp_create` 分配，`Release` 后由 purge 回收）。
+    owner: *mut ProxyObject,
     material: *mut c_void,
-    proxy: Box<dyn Proxy>,
 }
 // material 指针仅在渲染线程内使用，手动标记 Send 以放入 Mutex
 unsafe impl Send for ActiveProxy {}
 static ACTIVE: Mutex<Vec<ActiveProxy>> = Mutex::new(Vec::new());
 static NEXT_ACTIVE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// 注册需每帧执行的代理（材质加载时调用）。
+/// 登记一个需每帧执行的代理（引擎 `Init` 里调用，`owner` 即该引擎代理对象）。
 /// 同一材质可注册多个不同代理（各自独立条目）；**不能按材质去重**，否则同一材质上
 /// 多个 per-frame 代理只会保留最后一个（曾导致 `l4nrp_print_variable` 被
 /// `l4nrp_is_in_range` 替换而不执行，见 AGENTS.md 已知问题）。
-pub fn register_active(material: *mut c_void, proxy: Box<dyn Proxy>) {
-    let mut a = ACTIVE.lock().unwrap();
+unsafe fn register_active(owner: *mut ProxyObject, material: *mut c_void) {
+    let mut a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
     let id = NEXT_ACTIVE_ID.fetch_add(1, Ordering::Relaxed);
-    a.push(ActiveProxy { id, material, proxy });
+    a.push(ActiveProxy { id, owner, material });
 }
 
-/// D3D 每帧回调：对所有活动代理执行 `bind`（读当前材质变量 → 计算 → 写回）。
+/// 回收已被引擎 `Release` 的代理对象：先从 `ACTIVE` 摘除条目，再释放内存。
+/// 锁序固定为 `LIVE → ACTIVE`（`register_active` 只取 `ACTIVE`，不反向）。
+fn purge_released() {
+    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut keep: Vec<*mut ProxyObject> = Vec::with_capacity(live.0.len());
+    for &p in live.0.iter() {
+        if p.is_null() {
+            continue;
+        }
+        if unsafe { (*p).released.load(Ordering::Acquire) } {
+            {
+                let mut a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+                a.retain(|e| e.owner != p);
+            }
+            // SAFETY: 指针来自 `l4nrp_create` 的 `Box::into_raw`；本函数在本帧 items 快照
+            // 之前运行，且已摘除全部指向它的 ACTIVE 条目 —— 此刻无人使用。
+            unsafe { drop(Box::from_raw(p)) };
+        }
+        else {
+            keep.push(p);
+        }
+    }
+    live.0 = keep;
+}
+
+/// D3D 每帧回调：先回收引擎已 `Release` 的对象，再对所有活动代理执行 `bind`
+/// （读当前材质变量 → 计算 → 写回）。
 /// 注意：须先复制指针并释放 `ACTIVE` 锁再逐个 `bind`，避免锁重入死锁（见 AGENTS.md）。
 pub fn run_active_proxies() {
     // 先触发到期的计时器（l4nrp_delay_set 生成的）
     run_timers();
-    let items: Vec<(u64, *mut c_void, *mut Box<dyn Proxy>)> = {
-        let mut a = ACTIVE.lock().unwrap();
-        // `&raw mut` 取裸指针：`Box<dyn Proxy>` 存在 Vec 元素里，地址稳定，
-        // 且释放锁后仍要按裸指针逐个 bind（不能持有 `&mut` 借用）。
-        a.iter_mut().map(|e| (e.id, e.material, &raw mut e.proxy)).collect()
+    // 回收引擎已 Release 的对象（必须在生成 items 快照之前，避免用到已释放内存）
+    purge_released();
+    let items: Vec<(u64, *mut c_void, *mut ProxyObject)> = {
+        let a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        a.iter().map(|e| (e.id, e.material, e.owner)).collect()
     };
     // bind 返回 Err = 材质失效/变量缺失 → 从活动表移除该条目
     let mut stale: Vec<u64> = Vec::new();
-    for (id, m, p) in items {
-        if let Err(e) = unsafe { (&mut *p).bind(m) } {
+    for (id, m, owner) in items {
+        if owner.is_null() {
+            stale.push(id);
+            continue;
+        }
+        // SAFETY: owner 由 `purge_released` 保证存活（已 Release 的在本帧开始时被摘除/释放）
+        let obj = unsafe { &mut *owner };
+        let Some(proxy) = obj.proxy.as_mut() else {
+            stale.push(id);
+            continue;
+        };
+        if let Err(e) = unsafe { proxy.bind(m) } {
             crate::log(&format!(
                 "material '{}' error: {}",
                 unsafe { get_name(m) }.unwrap_or("?".into()), e
@@ -339,7 +559,7 @@ pub fn run_active_proxies() {
         }
     }
     if !stale.is_empty() {
-        let mut a = ACTIVE.lock().unwrap();
+        let mut a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
         a.retain(|e| !stale.contains(&e.id));
     }
 }
@@ -413,7 +633,6 @@ fn run_timers() {
     }
 }
 
-type FindKeyFn = unsafe extern "thiscall" fn(*mut c_void, *const c_char, u8) -> *mut c_void;
 type FirstChildFn = unsafe extern "fastcall" fn(*mut c_void) -> *mut c_void;
 type NextSiblingFn = unsafe extern "fastcall" fn(*mut c_void) -> *mut c_void;
 type GetKeyNameFn = unsafe extern "fastcall" fn(*mut c_void) -> *const c_char;
@@ -471,195 +690,12 @@ unsafe fn parse_proxy_params(proxy: &mut dyn Proxy, node: *mut c_void) {
     }
 }
 
-/// 用引擎 KeyValues 函数处理材质的 `"Proxies"` 块。
-///
-/// 返回 `true` 表示命中并处理了已注册代理（hook 据此决定透传策略，见 AGENTS.md）；
-/// 返回 `false` 表示无需拦截。
-///
-/// # Safety
-/// `material` 为有效 `IMaterial*`；`kv` 为材质 KeyValues 根。
-unsafe fn apply_proxies(material: *mut c_void, kv: *mut c_void) -> bool {
-    if kv.is_null() {
-        return false;
-    }
-    // 先取入口指针并判空，再 transmute（函数指针不可为 null，不能靠 transmute 后判空）
-    let find_key_p = ms_fn(0x76020);
-    let first_child_p = ms_fn(0x75dc0);
-    let next_sib_p = ms_fn(0x75dd0);
-    let get_name_p = ms_fn(0x75b90);
-    if find_key_p.is_null() || first_child_p.is_null() || next_sib_p.is_null() || get_name_p.is_null() {
-        crate::log("apply_proxies: engine KV functions unavailable (materialsystem not loaded?)");
-        return false;
-    }
-    let find_key: FindKeyFn = transmute(find_key_p);
-    let first_child: FirstChildFn = transmute(first_child_p);
-    let next_sib: NextSiblingFn = transmute(next_sib_p);
-    let get_name: GetKeyNameFn = transmute(get_name_p);
-
-    // 用引擎 FindKey 找 "Proxies" 块（create=0，不创建）
-    let proxies = find_key(kv, c"Proxies".as_ptr(), 0);
-    if proxies.is_null() {
-        return false;
-    }
-
-    // 遍历 "Proxies" 子键：处理我们注册的代理并把它从链表摘除（透传时引擎只处理剩余代理）
-    // 链表：proxies.m_pSub(+0x20) 首子键，节点 m_pPeer(+0x1c) 兄弟
-    let mut handled = false;
-    let mut prev: *mut c_void = core::ptr::null_mut();
-    let mut cur = first_child(proxies);
-    let mut guard = 0;
-    while !cur.is_null() && guard < 64 {
-        guard += 1;
-        let name_ptr = get_name(cur);
-        let mut is_ours = false;
-        if !name_ptr.is_null() {
-            let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-            let reg = REGISTRY.lock().unwrap();
-            if let Some(e) = reg.iter().find(|e| e.name == name) {
-                let mut proxy = (e.new_proxy)();
-                parse_proxy_params(&mut *proxy, cur);
-                crate::log(&format!(
-                    "apply_proxies: MATCH '{}' material=0x{:x}",
-                    name,
-                    material.addr()
-                ));
-                if proxy.per_frame() {
-                    // 持续计算：先执行一次并注册到活动表（D3D 每帧再执行）
-                    let _ = proxy.bind(material);
-                    register_active(material, proxy);
-                    crate::log(&format!("apply_proxies: '{}' registered per-frame", name));
-                }
-                else {
-                    // 一次性：仅材质加载时执行
-                    let _ = proxy.bind(material);
-                }
-                handled = true;
-                is_ours = true;
-            }
-        }
-        let next = next_sib(cur);
-        if is_ours {
-            // 摘除当前节点：前驱.m_pPeer = 当前.m_pPeer；若为首子键则 proxies.m_pSub = 当前.m_pPeer
-            // 这些槽位存的是 `KeyValues*`，用 `*mut *mut c_void` 语义写入（`byte_add` 按字节偏移）
-            if !prev.is_null() {
-                *prev.byte_add(0x1c).cast::<*mut c_void>() = next;
-            }
-            else {
-                *proxies.byte_add(0x20).cast::<*mut c_void>() = next;
-            }
-            *cur.byte_add(0x1c).cast::<*mut c_void>() = core::ptr::null_mut(); // 防残留
-        }
-        else {
-            prev = cur;
-        }
-        cur = next;
-    }
-    handled
-}
-
-// ---------- detour hook（FUN_10002d50） ----------
-// 指针创建约定（Strict Provenance）：入口地址由 `engine::get_proxy_parse_addr()` 以
-// `*const u8` 形式给出（HMODULE 基址 + RVA，见该函数），全程保持指针类型；
-// 只有「外部插件写在入口的 E9 rel32 目标地址」没有指针来源，需 `with_exposed_provenance`。
-/// 下一跳（trampoline 或先加载者 hook）的入口指针。trampoline 来自 `VirtualAlloc`（自带
-/// provenance）；链式接管时来自先加载者编码在入口的 `E9 rel32`，在 install 处一次性还原。
-static mut ORIGINAL_PROXY_PARSE: *const c_void = core::ptr::null();
-/// 被我们 patch 的函数入口（带 provenance，用于 uninstall 还原）。
-static mut HOOKED_TARGET: *mut u8 = core::ptr::null_mut();
-static mut HOOKED_SAVED: [u8; 5] = [0; 5];
-
-/// 改写 `target` 前 5 字节为 `E9 rel32`（近 JMP 到 `replacement`）。保存原字节。
-///
-/// # Safety
-/// `target` 必须是可执行内存中的函数入口，且前 5 字节可被改写。
-unsafe fn hook_function(target: *mut u8, replacement: usize) -> Result<(), PluginError> {
-    core::ptr::copy_nonoverlapping(target.cast_const(), (&raw mut HOOKED_SAVED).cast::<u8>(), 5);
-    let mut old_prot = std::mem::zeroed();
-    VirtualProtect(target.cast(), 5, PAGE_EXECUTE_READWRITE, &mut old_prot)?;
-    let rel = replacement.wrapping_sub(target.addr() + 5) as i32;
-    *target = 0xE9;
-    *target.add(1).cast::<i32>() = rel;
-    let mut tmp = std::mem::zeroed();
-    VirtualProtect(target.cast(), 5, old_prot, &mut tmp).ok();
-    HOOKED_TARGET = target;
-
-    Ok(())
-}
-
-/// 生成 trampoline：复制 `target` 前 `patch_len` 字节到可执行内存，再 JMP 回 `target+patch_len`。
-unsafe fn make_trampoline(target: *const u8, patch_len: usize) -> Result<*const c_void, PluginError> {
-    // VirtualAlloc 返回的指针自带 provenance：写入全程走这个裸指针，不转成 usize。
-    let mem = VirtualAlloc(None, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    if mem.is_null() {
-        return Err(PluginError::Windows(GetLastError().into()));
-    }
-    let mem_u8 = mem.cast::<u8>();
-    core::ptr::copy_nonoverlapping(target, mem_u8, patch_len);
-    *mem_u8.add(patch_len) = 0xE9;
-    let rel = (target.addr() + patch_len).wrapping_sub(mem.addr() + patch_len + 5) as i32;
-    *mem_u8.add(patch_len + 1).cast::<i32>() = rel;
-
-    Ok(mem.cast_const())
-}
-
-/// hook `FUN_10002d50`（materialsystem RVA 0x2d50）。入口 9 字节完整指令，trampoline 复制 9 字节。
-///
-/// # Safety
-/// `parse_addr` 必须指向已加载的 `FUN_10002d50` 入口。
-pub unsafe fn install(parse_addr: *const u8) -> Result<(), PluginError> {
-    if parse_addr.is_null() {
-        return Err(PluginError::InvalidPointer);
-    }
-    let original_entry: [u8; 9] = [0x55, 0x8B, 0xEC, 0x81, 0xEC, 0x08, 0x04, 0x00, 0x00];
-    let mut head: [u8; 5] = [0; 5];
-    core::ptr::copy_nonoverlapping(parse_addr, head.as_mut_ptr(), 5);
-    if head[0] == 0xE9 {
-        // 链式接管：FUN_10002d50 已被其它插件 detour，
-        // 解析入口 E9 rel32 得到先加载者 hook 作为下一跳，再把自己的 hook patch 到入口。
-        // 两个插件各自处理自己的代理，形成 hook 链，避免 trampoline 复制对方 jmp 崩溃。
-        //
-        // 此地址是先加载者编码进机器码的裸地址，没有任何指针可回溯其来源，
-        // 故在此（唯一一处）用 `with_exposed_provenance` 还原成指针后长期持有。
-        let rel = i32::from_le_bytes([head[1], head[2], head[3], head[4]]);
-        let next = parse_addr.addr().wrapping_add(5).wrapping_add(rel as usize);
-        ORIGINAL_PROXY_PARSE = with_exposed_provenance::<c_void>(next);
-        crate::log(&format!(
-            "install: FUN_10002d50 already hooked at 0x{:x}, chaining detour",
-            next
-        ));
-
-        return hook_function(parse_addr.cast_mut(), (proxy_parse_hook as *const ()).addr());
-    }
-    let mut cur: [u8; 9] = [0; 9];
-    core::ptr::copy_nonoverlapping(parse_addr, cur.as_mut_ptr(), 9);
-    if cur != original_entry {
-        return Err(PluginError::Unexpected(Box::from("FUN_10002d50 entry unexpected")));
-    }
-    // trampoline 指针自带 provenance，直接持有，无需经整数还原
-    ORIGINAL_PROXY_PARSE = make_trampoline(parse_addr, 9)?;
-    hook_function(parse_addr.cast_mut(), (proxy_parse_hook as *const ()).addr())
-}
-
-/// 还原被 hook 的函数入口。进程退出前可调用。
-pub unsafe fn uninstall() {
-    let target = (&raw const HOOKED_TARGET).read();
-    if !target.is_null() {
-        let mut old_prot = std::mem::zeroed();
-        VirtualProtect(target.cast(), 5, PAGE_EXECUTE_READWRITE, &mut old_prot).ok();
-        core::ptr::copy_nonoverlapping(
-            (&raw const HOOKED_SAVED).cast::<u8>(),
-            target,
-            5,
-        );
-        let mut tmp = std::mem::zeroed();
-        let _ = VirtualProtect(target.cast(), 5, old_prot, &mut tmp);
-    }
-}
-
 // ---------- D3D9 EndScene 每帧 hook（执行活动代理） ----------
 // D3D9 COM 方法为 __stdcall，故 hook 用 extern "system"（见 AGENTS.md）
 /// 原 EndScene 函数地址（来自 D3D vtable 槽，是外部函数指针，无 `&raw` 来源）。
 static mut ORIGINAL_ENDSCENE: usize = 0;
+/// 被我们改写的 vtable 槽（带 provenance，用于 `uninstall` 还原）。
+static mut HOOKED_ENDSCENE_SLOT: *mut usize = core::ptr::null_mut();
 
 type EndSceneFn = unsafe extern "system" fn(*mut c_void) -> i32;
 
@@ -691,6 +727,7 @@ pub unsafe fn install_d3d_endscene(device: *mut c_void) -> Result<(), PluginErro
     let mut old = std::mem::zeroed();
     VirtualProtect(slot.cast(), 4, PAGE_EXECUTE_READWRITE, &mut old)?;
     ORIGINAL_ENDSCENE = orig;
+    HOOKED_ENDSCENE_SLOT = slot;
     *slot = hook_addr;
     let mut t = std::mem::zeroed();
     VirtualProtect(slot.cast(), 4, old, &mut t).ok();
@@ -698,20 +735,22 @@ pub unsafe fn install_d3d_endscene(device: *mut c_void) -> Result<(), PluginErro
     Ok(())
 }
 
-/// proxy 解析 hook：处理 `"Proxies"` 块（命中注册表则创建代理 + 注入参数 + bind），
-/// 并总是透传原函数（我们的代理已摘除，引擎只处理剩余内置代理，见 AGENTS.md）。
-unsafe extern "thiscall" fn proxy_parse_hook(this: *mut c_void, kv: *mut c_void) {
-    // this = CMaterial，kv = 材质 KeyValues
-    let handled = apply_proxies(this, kv);
-    if handled {
-        crate::log(&format!("apply_proxies: 0x{:x} handled", this.addr()));
-    }
-    // 总是透传（我们的代理已摘除，可与内置代理共存）。
-    // 加固：链式下一跳（trampoline 或先加载者 hook）无效时安全返回，避免调用坏指针。
-    let orig_ptr = (&raw const ORIGINAL_PROXY_PARSE).read();
-    if orig_ptr.is_null() || crate::kv::test_readable(orig_ptr).is_err() {
+/// 还原 `EndScene` vtable 槽（插件析构时调用）。
+///
+/// 引擎原生代理注册（`CMaterialProxyDict::AddProxy`）**无法撤销**：该工厂只有
+/// CreateProxy / DeleteProxy / AddProxy 三个槽位，没有删除名字的接口；已实例化的
+/// 代理对象也由引擎按材质生命周期调用 `Release()` 回收（见 `purge_released`）。
+/// 因此这里只还原我们自己 patch 的 D3D vtable 槽。
+pub unsafe fn uninstall() {
+    let slot = (&raw const HOOKED_ENDSCENE_SLOT).read();
+    if slot.is_null() {
         return;
     }
-    let orig: unsafe extern "thiscall" fn(*mut c_void, *mut c_void) = transmute(orig_ptr);
-    orig(this, kv);
+    let orig = (&raw const ORIGINAL_ENDSCENE).read();
+    let mut old = std::mem::zeroed();
+    VirtualProtect(slot.cast(), 4, PAGE_EXECUTE_READWRITE, &mut old).ok();
+    *slot = orig;
+    let mut t = std::mem::zeroed();
+    let _ = VirtualProtect(slot.cast(), 4, old, &mut t);
+    HOOKED_ENDSCENE_SLOT = core::ptr::null_mut();
 }

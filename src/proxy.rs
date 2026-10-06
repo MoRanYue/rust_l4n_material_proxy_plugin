@@ -224,10 +224,13 @@ enum VarType {
 impl VarType {
     fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
+            "float" | "f32" | "number" | "double" => VarType::Float,
             "int" | "integer" => VarType::Int,
             "vector" | "vec3" | "vec" => VarType::Vector,
             "string" | "str" | "text" => VarType::String,
-            _ => VarType::String,
+            // 未识别的写法按默认值（Float）处理，与不写 `type` 时一致；
+            // 早先这里返回 String，导致显式写 `type "float"` 反而按字符串读取。
+            _ => VarType::Float,
         }
     }
 }

@@ -124,11 +124,11 @@ unsafe extern "thiscall" fn get_version(_this: *const L4NPlugin) -> *const c_cha
     VERSION.as_ptr()
 }
 
-/// 尝试绑定 IMaterialSystem + 注册代理 + hook 引擎 proxy 解析函数（幂等）。
+/// 尝试绑定 IMaterialSystem + 注册代理 + 把代理登记进引擎代理工厂（幂等）。
 unsafe fn try_bind_and_install() -> Result<(), PluginError> {
     use std::sync::atomic::{AtomicBool, Ordering};
-    static HOOKED: AtomicBool = AtomicBool::new(false);
-    if HOOKED.load(Ordering::SeqCst) {
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.load(Ordering::SeqCst) {
         return Ok(());
     }
 
@@ -155,10 +155,18 @@ unsafe fn try_bind_and_install() -> Result<(), PluginError> {
         material::registered_names()
     ));
 
-    // 3. hook 引擎 proxy 解析函数 FUN_10002d50
-    let parse = engine::get_proxy_parse_addr()?;
-    material::install(parse)?;
-    HOOKED.store(true, Ordering::SeqCst);
+    // 3. 把代理登记进 client.dll 的 CMaterialProxyDict（引擎原生代理工厂）。
+    //    此后引擎自己的 VMT 解析器会为 `"Proxies"` 块里出现的 `l4nrp_*` 调用我们的
+    //    createFn 并驱动 Init/Release —— 不再 detour 引擎解析函数，
+    //    也不再从 `"Proxies"` 块里摘除节点（见 AGENTS.md「材质代理注册」）。
+    match material::register_engine_proxies() {
+        Ok(n) => log(&format!("registered {n} proxies into CMaterialProxyDict")),
+        Err(e) => {
+            log(&format!("engine proxy registration failed: {e}"));
+            return Err(e);
+        }
+    }
+    INSTALLED.store(true, Ordering::SeqCst);
 
     Ok(())
 }
@@ -174,8 +182,8 @@ unsafe extern "thiscall" fn on_module_loaded(
 
         if name == "client" {
             match try_bind_and_install() {
-                Ok(_) => log("Successfully installed hooks"),
-                Err(e) => log(&format!("Failed to install hooks: {}", e)),
+                Ok(_) => log("Successfully installed"),
+                Err(e) => log(&format!("Failed to install: {}", e)),
             }
         }
     }

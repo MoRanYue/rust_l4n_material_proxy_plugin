@@ -21,9 +21,9 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 | 文件 | 职责 |
 |---|---|
 | [`src/lib.rs`](src/lib.rs) | 插件入口：IL4NPlugin 虚表/实现、注册与 hook 安装时序 |
-| [`src/engine.rs`](src/engine.rs) | IMaterialSystem 绑定 + `FUN_10002d50`（proxy 解析函数）地址获取 |
+| [`src/engine.rs`](src/engine.rs) | IMaterialSystem 绑定 + `client.dll` 的 `CMaterialProxyDict` 工厂（`material_proxy_factory` / `add_material_proxy`） |
 | [`src/kv.rs`](src/kv.rs) | `Proxy` trait 定义 + 内存可读性检查（`is_readable`） |
-| [`src/material.rs`](src/material.rs) | 代理注册表、KeyValues 解析、detour hook、D3D EndScene 每帧执行 |
+| [`src/material.rs`](src/material.rs) | 代理注册表、引擎侧 `ProxyObject`（7 槽 vtable）、KeyValues 参数解析、D3D EndScene 每帧执行 |
 | [`src/menu.rs`](src/menu.rs) | L4N 接口 v2 的 HUD 菜单（`RequestHudMenu`）：标题、KV 菜单结构、`callback` 子菜单 |
 | [`src/util.rs`](src/util.rs) | 通用小工具：`RelativeCompare`（f32 相对比较，容差 1e-6），供比较类代理复用 |
 | [`src/expr.rs`](src/expr.rs) | 表达式求值器（无依赖）：数学 + 比较（`== != < <= > >=`）+ 逻辑（`&& \|\| !`），供 `l4nrp_math` / `l4nrp_logic` 使用 |
@@ -86,53 +86,82 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 - 返回的指针必须在 left4neko `strlen` + 解析期间保持有效：本插件返回 `static`/`OnceLock`
   里的 `CString` 指针，`callback` 的子菜单文本存进 `Mutex<Option<CString>>` 后返回其指针。
 
-## 逆向背景（为什么不能"正常"创建代理对象）
+## 材质代理注册（v6：真正注册进引擎代理工厂）
 
-**left4neko 深 hook 了材质系统**（patch 了 `GetMaterialProxyFactory` 及 proxy 解析链）。
-若插件创建自定义 `IMaterialProxy` 对象并放入材质 proxy 数组，left4neko 会把它按自己的
-`CResultProxy` 布局处理而崩溃（`left4neko+0xE2AB8`：`FUN_100e2a60` 读坏指针）。
+**当前机制：把 `l4nrp_*` 直接注册进 `client.dll` 的 `CMaterialProxyDict`**，让引擎自己的 VMT
+解析器去实例化它们 —— 不再 detour 引擎函数，也不再手动摘除 `"Proxies"` 链表节点。
 
-历史方案：
-- v1–v3：链式 hook proxy factory 创建对象 → 崩溃
-- v4：hook 引擎解析函数后透传原函数 → 原函数调用 left4neko `CreateProxy` 仍崩溃，且自解析
-  KeyValues 布局遇到特殊材质（如 `Shadow`）会遍历越界
-- **v5（当前）**：不创建代理对象，hook 引擎解析 `"Proxies"` 块的函数 → 稳定生效、不崩溃
+### 工厂与注册 API（逆向确认）
 
-## v5 实现机制
+| 项 | 位置 | 说明 |
+|---|---|---|
+| 工厂单例 getter | `client.dll` RVA `0x13ab40` | `__cdecl` 无参，惰性构造并返回 `&CMaterialProxyDict`（= `client+0x75e928`） |
+| 工厂 vtable | `client.dll` RVA `0x576d94` | 恰 3 槽：`[0]` CreateProxy、`[1]` DeleteProxy、`[2]` AddProxy |
+| `AddProxy` | vtable 槽 `[2]` | `__thiscall(this, const char* name, CreateFn create_fn)`，`RET 0x8` |
 
-### 引擎真实 proxy 协议（逆向确认）
+注册流程（`src/engine.rs` + `src/material.rs` 的 `register_engine_proxies`）：
 
-materialsystem.dll `FUN_10002d50`（RVA `0x2d50`）是引擎解析 VMT `"Proxies"` 块的函数，
+1. `engine::material_proxy_factory()` 取单例；
+2. 对注册表里每个代理名 `AddProxy(name, l4nrp_create)` —— 名字 `Box::leak` 故意泄漏
+   （`AddProxy` 是否复制名字未验证）；`create_fn` 全部指向同一个 `l4nrp_create`；
+3. 引擎解析 VMT `"Proxies"` 块时调 `CreateProxy(name)` → 得到我们的 `ProxyObject` → 调
+   `Init(name, kv)` → 我们在 `Init` 里查 `REGISTRY`、`apply_kv` 注入参数、`bind` 一次，
+   并把 `per_frame()` 为真的代理登记进活动表。
+
+**因此 `l4n_is_proxy_exist` 现在能查到 `l4nrp_*`**（实机验证过，见下）。
+
+### 引擎解析链（`materialsystem.dll` RVA `0x2d50`，`FUN_10002d50`）
+
 `thiscall(this=CMaterial, param_1=材质 KeyValues)`：
 
-- 内部 `FUN_10076020(kv,"Proxies",0)`（FindKey）找 `"Proxies"` 块；
-- 遍历其子键，对每个代理名调 `ProxyFactory->CreateProxy(name)`（**factory vtable[0]**）；
-- 创建后 `Init`（参数与 `material+0x80` 相关），成功则存入材质代理数组（`this+0x28`，计数
-  `this+0x23`）；
-- 引擎只在 `GetProxyFactory()` 非空且找到块时才做事，否则直接返回。
+- `FUN_10076020(kv,"Proxies",0)`（FindKey）找 `"Proxies"` 块；
+- 遍历其子键，对每个代理名调 `GetMaterialProxyFactory()->CreateProxy(name)`；
+- **`Init` 的真实 ABI**（字节级确认，与 SDK 头不同）：
 
-> left4neko 深 hook 了 `CreateProxy`（factory vtable[0]），传入未知名会按 `CResultProxy` 布局处理
-> → 崩溃。因此我们的代理名**不能**落到这条路径，必须由本插件在引擎解析时拦截并摘除。
+  ```
+  10002df0  MOV ECX,[EDI]            ; proxy->vtable
+  10002df2  MOV EDX,[ESI]            ; material->vtable
+  10002df4  MOV EAX,[EDX+0x17c]      ; material vtable +0x17c → 名字字符串
+  10002dfd  PUSH EBX                 ; 第 2 参 = KeyValues* 子键
+  10002dfe  MOV ECX,ESI / CALL EAX   ; 取名字
+  10002e05  PUSH EAX                 ; 第 1 参 = const char* 名字
+  10002e08  MOV ECX,EDI / CALL EAX   ; proxy->Init(name, kv)
+  10002e0c  TEST AL,AL               ; 返回 bool
+  ```
 
-1. **hook `FUN_10002d50`**（materialsystem RVA `0x2d50`，`thiscall(this=CMaterial, param_1=材质 KeyValues)`）
-   入口。入口 9 字节完整指令为 `55 8B EC 81 EC 08 04 00 00`（PUSH EBP; MOV EBP,ESP; SUB ESP,0x408），
-   trampoline 复制 9 字节后 JMP 回 `+9`。
-2. **用引擎自己的 KeyValues 函数**处理 `"Proxies"` 块（不再自解析布局，避免 `Shadow` 式越界）：
+  → **`bool __thiscall Init(const char* materialName, KeyValues* kv)`**，第 1 参是**名字字符串**
+  而非 `IMaterial*`（`AnimatedTexture` 的 `Init` 以 `RET 0x8` 收尾，证实恰好 2 个栈参）。
+- `Init` 返回 false 时引擎走 `factory->DeleteProxy(proxy)`；我们恒返回 true。
+- 成功则存入材质代理数组（`this+0x28`，计数 `this+0x23`）—— 注意这两个字段由引擎在
+  `ParseProxies` **尾段**才写入，`FindMaterial` 刚返回时读到的仍是 0（不是注册失败的证据）。
 
-   | 引擎函数 | 作用 | RVA |
-   |---|---|---|
-   | `FUN_10076020` | FindKey(kv, name, create) | `0x76020` |
-   | `FUN_10075dc0` | FirstChild | `0x75dc0` |
-   | `FUN_10075dd0` | NextSibling | `0x75dd0` |
-   | `FUN_10075b90` | GetKeyName | `0x75b90` |
+### 我们的 `ProxyObject`（`src/material.rs`）
 
-3. 命中注册表 → 创建 `Box<dyn Proxy>`，把 `"Proxies"` 块参数（键值对）经 `apply_kv` 注入，再
-   `bind(material)`。
-4. 处理我们的代理后把它从 `"Proxies"` 链表**摘除**，且**总是透传**原 `FUN_10002d50` —— 引擎只
-   处理剩余原版/L4N 代理（不会再把我们的代理名传给 left4neko `CreateProxy` 而崩溃），**因此可与
-   内置材质代理共存**（同一 `"Proxies"` 块里 `Sine`/`Multiply` 与 `l4nrp_*` 并存）。
-   - 摘除链表节点：前驱 `m_pPeer(+0x1c) = 当前.m_pPeer`；若为首子键则 `proxies.m_pSub(+0x20) =
-     当前.m_pPeer`，并把当前节点 `m_pPeer` 置空防残留。
+7 槽 vtable，对齐 `AnimatedTexture`（`client.dll` RVA `0x53cb48`）实测布局：
+
+| 槽 | 字节偏移 | 我们的实现 | 语义 |
+|---|---|---|---|
+| 0 | `+0x00` | `po_init` | `Init(name, kv)`，`RET 0x8`，恒返回 1 |
+| 1 | `+0x04` | `po_on_bind` | 空实现（per-frame 仍由 EndScene 驱动） |
+| 2 | `+0x08` | `po_release` | 置 `released` 标志，供 `purge_released` 回收 |
+| 3 | `+0x0c` | `po_get_material` | 返回 `(*this).material` |
+| 4 | `+0x10` | `po_scalar_deleting_dtor` | 标量删除析构，`RET 0x4` |
+| 5 | `+0x14` | `po_noop_float` | 返回 `0.0f` |
+| 6 | `+0x18` | `po_noop` | 空实现 |
+
+- **对象内存由 `Box::into_raw` 分配**（Rust 全局分配器）。引擎的 `Release()` 走
+  `AnimatedTexture` 的 `0x1000e5f0` 模式 —— `if (this) this->vtable[0x10](1)` → 标量删除析构 →
+  **`client.dll` 的 `operator delete`（RVA `0x100011f0`）**。为避免「Rust 分配 / MSVC 释放」的
+  堆不匹配，我们**不实现真正的释放**：`po_scalar_deleting_dtor` 只置 `released` 标志，
+  真正的 `Box::from_raw` 由 `purge_released()` 在下一帧完成。
+- `LIVE` 表保存全部已创建对象指针；`ACTIVE` 表保存需要每帧 `bind` 的条目
+  （`ActiveProxy { id, owner, material }`），`owner` 指回 `ProxyObject`，`Release` 后由
+  `purge_released()` 一并回收。锁序固定 `LIVE → ACTIVE`。
+
+### 与内置代理共存
+
+`l4nrp_*` 现在是引擎眼里的**一等代理**，与原版 / L4N 内置代理（`Sine`/`Multiply`/
+`AnimatedTexture`/`IT`/`BloodyHands` 等）走完全相同的路径，可自由混写在同一个 `"Proxies"` 块里。
 
 ## KeyValues 真实布局（实测，非 SDK2013 假设）
 
@@ -181,27 +210,36 @@ materialsystem.dll `FUN_10002d50`（RVA `0x2d50`）是引擎解析 VMT `"Proxies
 
 ## 每帧执行（D3D9 EndScene hook）
 
-原版代理每帧 `OnBind`，而我们的代理若只在材质加载时触发一次，对依赖每帧输入的持续计算会"无效"。
-因此插件 **hook D3D9 `EndScene`（vtable 索引 42）**：把 `per_frame() == true` 的代理注册到活动表，
-每帧对已注册材质再次执行 `bind`。
+引擎只在材质 bind 时调代理的 `OnBind`，而 `per_frame()` 代理依赖每帧输入（如 `Sine` 输出）。
+因此插件 **hook D3D9 `EndScene`（vtable 索引 42）**：`po_init` 把 `per_frame() == true` 的代理
+连同材质指针登记进活动表，`EndScene` 每帧对它们再次执行 `bind`。
 
 > **D3D9 COM 方法为 `__stdcall`**（逆向依据：`ghidra_d3d.txt`，left4neko Present hook
 > `LAB_100a8b90`：this 从栈取、`RET n` 清栈），故 EndScene hook 用 `extern "system"`（x86 即 stdcall），
 > **不能用 thiscall**。
 
+> **为什么不用引擎的 `OnBind`**：实机验证显示引擎**从不调用**我们对象的 `OnBind`
+> （`po_on_bind` 命中 0 次），且材质 bind 的频率低于帧率，会漏帧。EndScene 路线已被实测证明
+> 与帧计数严格同步（见下）。
+
 ## 线程 / 锁 / 内存安全注意事项
 
-- **Mutex 重入死锁**：`run_active_proxies` 必须**先复制 (material, proxy 指针) 并释放 `ACTIVE` 锁**，
-  再逐个 `bind`。若持有锁期间 `bind` 经引擎回调（如创意工坊 Mod 刷新材质 → `apply_proxies` →
+- **Mutex 重入死锁**：`run_active_proxies` 必须**先复制 (material, owner 指针) 并释放 `ACTIVE` 锁**，
+  再逐个 `bind`。若持有锁期间 `bind` 经引擎回调（如创意工坊 Mod 刷新材质 → `po_init` →
   `register_active`）再次对 `ACTIVE` 加锁，会造成 `std::sync::Mutex` 重入死锁（表现为"无响应"）。
 - **`ActiveProxy` 手动 `unsafe impl Send`**：`material` 指针仅在渲染线程内传递与使用（不跨线程拥有）。
 - **`bind` 返回 `Err` = 材质失效/所需变量缺失** → 调用方从活动表移除该代理（防止悬垂 + 引擎
   `FindVar` 警告刷屏）。
 - **读指针前先 `is_readable` 检查**（`VirtualQuery`）：防止 `strlen`/`CStr` 读到坏指针崩溃。
   `is_readable` 复用 32 位 `MEMORY_BASIC_INFORMATION` 布局（`Mbi32`，x86）。
-- **Detour hook**：`hook_function` 改写目标前 5 字节为 `E9 rel32`（近 JMP）并保存原字节；
-  `make_trampoline` 复制目标前 `patch_len` 字节到 `VirtualAlloc` 分配的可执行内存再 JMP 回
-  `target+patch_len`；`uninstall` 用保存的 5 字节还原入口。
+- **堆归属**：`ProxyObject` 由 Rust 全局分配器（`Box::into_raw`）分配，而引擎的 `Release()` 路径
+  最终会走到 **`client.dll` 的 `operator delete`**。因此 `po_scalar_deleting_dtor` **只置标志、
+  不释放**，真正的 `Box::from_raw` 由 `purge_released()` 在下一帧完成 —— 绝不能把
+  `operator delete` 当成 Rust 的释放器用。
+- **`LIVE` / `ACTIVE` 锁序固定 `LIVE → ACTIVE`**：`purge_released` 持 `LIVE` 时再取 `ACTIVE`；
+  `register_active` 只取 `ACTIVE`，不反向，故无死锁。
+- **`Mutex` 一律用 `unwrap_or_else(|e| e.into_inner())`**：`panic = "abort"` 下 `.unwrap()` 的
+  poison panic 会直接让游戏崩溃。`REGISTRY` / `TIMERS` 等既有处仍是 `.unwrap()`（历史遗留）。
 
 ## 裸指针创建约定（Strict Provenance）
 
@@ -224,26 +262,25 @@ materialsystem.dll `FUN_10002d50`（RVA `0x2d50`）是引擎解析 VMT `"Proxies
 - `materialsystem.dll` 各引擎函数地址由 `ms_fn(rva)` 返回 **`*const u8`**（`HMODULE` 基址
   `.add(rva)` 指针算术），不再经 `usize` 中转 —— `HMODULE` 本身就是模块映射基址（Rust 文档
   第 4 条「Get it from C」），自带 provenance；
-- `engine::get_proxy_parse_addr()` 返回 `*const u8`，`material::install()` 接收 `*const u8`；
-- trampoline 指针来自 `VirtualAlloc`（自带 provenance），`ORIGINAL_PROXY_PARSE` 直接以
-  `*const c_void` 持有，不存成 `usize` 再还原。
+- `engine::material_proxy_factory()` 取到的工厂对象是引擎给的 `*mut c_void`（来自
+  `__cdecl` getter 的返回值），**全程保持指针类型**；`add_material_proxy` 从工厂首字段读出
+  vtable、再读槽位 2 得到函数地址，该地址以 `usize` 取出后 `transmute` 成函数指针
+  （函数指针槽位没有 `&raw` 来源，这是必需的例外）。
 
-> **`with_exposed_provenance` 不是"旧写法兼容"**：它与 `.addr()` 同属 strict provenance 家族
-> （1.84 稳定），用途是"地址来自外部、无法回溯来源"。项目里**仅剩一处**必需：
-> `install()` 链式接管时，下一跳地址由先加载者写在入口的 `E9 rel32` 解码得到
-> （`material.rs`，`ORIGINAL_PROXY_PARSE = with_exposed_provenance::<c_void>(next)`）。
-> `with_exposed_provenance_mut` 已无使用（所有写入都走带 provenance 的指针）。
+> **`with_exposed_provenance` 目前已无使用**：v6 起不再 detour 引擎函数，没有"从 `E9 rel32`
+> 解码出外部地址"的场景了。它与 `.addr()` 同属 strict provenance 家族（1.84 稳定），用途是
+> "地址来自外部、无法回溯来源"；若将来重新引入 detour 才需要它。
 
 > **不要用 `transmute` 把空指针变成函数指针再判空**：函数指针不可为 null，
 > `(fn_ptr as *const ()).is_null()` 恒为 `false`（clippy 会报
 > `fn_to_numeric_cast`/`fn_null_check`）。必须先对**源指针**判空再 `transmute`
-> （见 `parse_proxy_params` / `apply_proxies`）。
+> （见 `parse_proxy_params` / `engine::add_material_proxy`）。
 
-验证手段（`fuzzy_provenance_casts` / `lossy_provenance_casts` 目前仍是 unstable）：
+验证手段（lint 已改名为 `implicit_provenance_casts`，仍是 unstable）：
 
 ```powershell
 $env:RUSTC_BOOTSTRAP="1"
-$env:RUSTFLAGS='-Zcrate-attr=feature(strict_provenance_lints) -W fuzzy_provenance_casts -W lossy_provenance_casts'
+$env:RUSTFLAGS='-Zcrate-attr=feature(strict_provenance_lints) -W implicit_provenance_casts'
 cargo build --release   # 当前 0 命中
 ```
 
@@ -385,27 +422,63 @@ cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/e
 
 ## 已知问题
 
-- v5.5：**链式 detour 兼容**：`install()` 检测 `FUN_10002d50` 入口为 `E9 rel32`（已被其它
-  插件如 `rust_l4n_node_texture_plugin` hook）时，解析出先加载者 hook 作为下一跳
-  （`ORIGINAL_PROXY_PARSE`），再把自己 patch 到入口；`proxy_parse_hook` 在下一跳无效时
-  安全返回。这样可与 `rust_l4n_node_texture_plugin` **同时使用**（各自处理自己的代理）。
-- v5.1：处理我们的代理后从 `"Proxies"` 链表**摘除**再透传，因此可与原版/L4N 材质代理共存（同一
-  `"Proxies"` 块里既有 `Sine`/`Multiply` 等内置代理，也有 `l4nrp_*`）。摘除只改一次材质 KeyValues
-  树（仅移除我们的代理节点），对引擎其余逻辑无影响。
-- v5.2：`per_frame()` 代理注册到活动表并在 D3D EndScene 每帧执行。EndScene 回调里**先复制指针再
-  释放 `ACTIVE` 锁**后才执行 `bind`（避免持锁期间 `bind` 内部重新入锁导致 Mutex 重入死锁 ——
-  表现为游戏无响应）。材质被引擎销毁后活动表条目可能**悬垂**（暂未做清理）；若切换地图/重载材质
-  后崩溃，请将该材质改用一次性代理，或后续增加材质析构回调清理活动表。
-- v5.3：`Proxy::bind` 返回 `Result`；材质被引擎卸载/替换（活动表持有悬垂指针）或所需输出变量缺失时
-  返回 `Err`，`run_active_proxies` 会从活动表**移除失效条目**，避免 "No such variable" 刷屏 /
-  崩溃。
-- v5.4：`register_active` **不能按材质去重**。曾按 `material` 去重（同一材质已有则替换），导致同一
-  材质上注册多个 per-frame 代理时只有最后一个生效（如 `l4nrp_print_variable` 被
-  `l4nrp_is_in_range` 替换而不执行，表现为"没有每帧输出"）。现改为每条目分配唯一 `id`，同一材质
-  可挂多个独立代理；失效条目按 `id` 移除。
+- v6.0：**代理注册无法撤销**。`CMaterialProxyDict` 只有 CreateProxy / DeleteProxy / AddProxy
+  三个槽位，**没有"按名字删除"的接口**，所以插件析构时只能还原 D3D `EndScene` vtable 槽，
+  引擎侧的代理名字条目会留到进程结束。名字字符串也是 `Box::leak` 故意泄漏的（`AddProxy` 是否
+  复制名字未验证），泄漏量 = 15 个短字符串，可忽略。
 - v6.1：HUD 菜单 `"cvar"` 条目的**夹取方向未完全确定**。`FUN_10049350` 的越界分支在反编译里呈现为
   `if ((*(float*)(param_1+0x4c) + 1e-06 < local_30) || (local_30 < *(float*)(param_1+0x48) - 1e-06)) local_30 = *(float*)(param_1+0x4c);`
   —— `+0x48` / `+0x4c` 哪个是 `min`、哪个是 `max`，以及越界时夹到哪一端，未能完全确定。
   因此 `"菜单横向偏移"` 条目的实际效果是「每次点击把 `l4n_hudmenu_offset_x` 朝某个方向调整」，
   极端情况下可能直接落到 `±500` 边界（可见但无害、可恢复）。
   要精确验证需在实机里点击该菜单项并观察 convar 的实际变化方向。
+- v6.2：**`material+0x23` / `material+0x28` 的读取时机**。这两个字段（代理计数 / 代理数组）
+  由引擎在 `ParseProxies` **尾段**才写入；在 `FindMaterial` 刚返回时读到的仍是 0 / 空。
+  排查问题时不要把它当成"注册失败"的证据。
+- v6.3：`REGISTRY` / `TIMERS` 相关的锁仍用 `.unwrap()`（历史遗留）。`panic = "abort"` 下
+  poison panic 会直接崩溃游戏；新代码一律用 `unwrap_or_else(|e| e.into_inner())`。
+
+## 历史方案（v1–v5，已废弃）
+
+以下机制**已全部被 v6 取代**，保留记录以免重走弯路：
+
+- **v1–v3**：链式 hook proxy factory 创建对象 → 崩溃。
+- **v4**：hook 引擎解析函数后透传原函数 → 原函数调用 left4neko `CreateProxy` 仍崩溃，且自解析
+  KeyValues 布局遇到特殊材质（如 `Shadow`）会遍历越界。
+- **v5**：**detour `materialsystem.dll` RVA `0x2d50`（`FUN_10002d50`）**，在引擎解析 `"Proxies"`
+  块时拦截我们的代理名、用引擎自己的 KeyValues 函数（`0x76020` FindKey / `0x75dc0` FirstChild /
+  `0x75dd0` NextSibling / `0x75b90` GetKeyName）解析参数，然后**把节点从链表摘除**再透传原函数。
+  可用但不彻底：`l4n_is_proxy_exist` 查不到（代理不在引擎表里），且 `uninstall` 只能还原入口字节。
+
+> **旧结论已作废**：曾认为"left4neko 深 hook 材质系统，自定义 `IMaterialProxy` 会被按
+> `CResultProxy` 布局处理而崩溃"（曾引 `left4neko+0xE2AB8`）。该结论**无法复现**：
+> `left4neko+0xE2AB8` 不是函数入口（`create_function` → `body_size=1`），真实入口
+> `FUN_100e2a68` 反编译后**无任何 `CResultProxy` 布局证据**；`list_globals(ResultProxy)` 为 0 条。
+> 实机探针（v5/v6）已证明自定义 `IMaterialProxy` 能安全注册并被引擎正常驱动。
+>
+> 另外，"left4neko 改写了 `VClient016->vtbl[0x128]`" 是**真的**（运行时该槽 =
+> `left4neko+0xe4ab0`），但它只影响 `l4n_is_proxy_exist` 的查询路径：
+> `FUN_100e4ab0` 先查 left4neko 自己的 `IMaterialProxyDict`（单例 getter `FUN_100c2df0`），
+> **未命中再回退到引擎原生的 `client+0xa9570`**（= `GetProxyFactory()->CreateProxy(name)`）。
+> 所以只要注册进了 `CMaterialProxyDict` 且 `createFn` 返回非空，`l4n_is_proxy_exist` 就能查到。
+
+## 端到端实机验证记录（v6）
+
+用临时探针插件 `l4n_probe.dll`（只观察、不注册）+ 测试材质 `l4n/l4nrp_e2e_test.vmt` 在真实游戏中验证：
+
+| 验证项 | 结果 |
+|---|---|
+| 注册 | 工厂 `m_nProxies` 67 → **82**（+15）；`CreateProxy("l4nrp_math")` 等 6 个名字全部返回非空 |
+| 不存在的名字 | `CreateProxy("__l4nrp_no_such_proxy__")` → `0x0`（对照正确） |
+| `l4n_is_proxy_exist` | 复刻其路径，6 个 `l4nrp_*` 全部返回非空（= 会打印 `exist!`） |
+| 引擎实例化 | 插件日志 `engine proxy: 'l4nrp_math' Init material=0x... per_frame=true` × 24 |
+| 生命周期 | `engine proxy: Release` 30+ 次；`purge_released` 正常回收（active 18→17→16…） |
+| **每帧驱动** | 测试 VMT 里的自增计数器 `$e2eWatch` 与 EndScene 帧计数**严格同步递增**（第 300 帧读到 297→298，第 600 帧读到 597→598） |
+| 稳定性 | 多次运行无崩溃 |
+
+> 验证手法：`Start-Process left4dead2.exe -ArgumentList '-steam -insecure -language schinese
+> -heapsize 2097151 -novid -nojoy -noforcemaccel -noforcemspd -noforcemparms +exec autoexec.cfg'`
+> （`-insecure` 允许加载本地未签名插件），等 50–60 s 后检查 `MainWindowTitle` 是否为
+> `Left 4 Dead 2 - Direct3D 9`（崩溃时是「哇袄！游戏爆炸了!」）。
+> **诊断读数必须与"测试材质确实被加载"同时成立才有意义** —— 曾因测试材质未被加载而看到
+> `active proxies: 0`，误判为"每帧驱动没跑"。

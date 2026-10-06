@@ -2,6 +2,8 @@
 
 L4N 插件：**在 Rust 中注册自定义材质代理（material proxy）**。在 VMT 的 `"Proxies"` 块里写代理名，即可触发插件回调，回调内可读写该材质的 VMT 变量（变色、比较运算、打印变量等）。
 
+代理是**直接注册进引擎的材质代理工厂**（`client.dll` 的 `CMaterialProxyDict`）的，与 `Sine`/`Multiply`/`AnimatedTexture` 等内置代理同级：引擎自己解析 VMT 并实例化它们，`l4n_is_proxy_exist` 也能查到。
+
 本插件实现了 **L4N 插件接口 v2**（`IL4NPlugin`），除材质代理外还提供一个 **HUD 菜单入口**（见[游戏内 HUD 菜单](#游戏内-hud-菜单)）。
 
 对于添加的材质代理详情，见 [`Example.vmt`](Example.vmt)。
@@ -147,7 +149,7 @@ LessOrEqual:  srcVar1 <= srcVar2 ? LessEqualVar : greaterVar
 ### 注意事项
 
 - 代理只能读写**已在 VMT 声明**的变量（引擎只为声明过的变量创建变量对象）。若想让代理写入某个变量，请先在 VMT 顶层声明它，例如 `"$result_var" "0"`。
-- 插件与**原版/L4N 内置材质代理共存**：同一个 `"Proxies"` 块里 `Sine`/`Multiply`/`Sequence`（L4N的材质代理） 与 `l4nrp_*`可同时使用。
+- 插件与**原版/L4N 内置材质代理共存**：`l4nrp_*` 是引擎眼里的普通材质代理，同一个 `"Proxies"` 块里 `Sine`/`Multiply`/`AnimatedTexture`/`IT`/`BloodyHands` 等与 `l4nrp_*` 可自由混写。
 - `l4nrp_random` 的 `min`/`max`/`shared` 既可以写字面量（`"0"`）也可以写变量名（`"$frameLimit"`）；其它代理的 `min`/`max` 一律按变量名处理。
 - `l4nrp_math` 与 `l4nrp_logic` 的表达式里，`$var` 与 `var` 等价；未声明的变量按 `0` 处理（不报错）。
 
@@ -187,16 +189,21 @@ LessOrEqual:  srcVar1 <= srcVar2 ? LessEqualVar : greaterVar
 插件输出 `l4n_material_proxy_plugin.log`（当前工作目录），同时在引擎控制台以 `[l4n-proxy]` 前缀输出。启动游戏进主菜单后，日志里应能看到代理注册、命中与生效记录：
 
 ```
-[l4n-proxy] registered proxies: ["does_equal", ...]
-[l4n-proxy] proxy parse hook installed ...
+[l4n-proxy] registered proxies: ["l4nrp_does_equal", "l4nrp_compare", ...]
+[l4n-proxy] registered 15 proxies into CMaterialProxyDict
+[l4n-proxy] Successfully installed
 [l4n-proxy] RequestHudMenu(title): 已向 left4neko 注册 HUD 菜单入口
 [l4n-proxy] RequestHudMenu(structure): callback=0x........ user_data=0x........
 [l4n-proxy] 菜单回调被调用（user_data = "L4NRP HUD menu callback"）
-[l4n-proxy] 菜单回调：已注册 14 个代理
-[l4n-proxy] apply_proxies: MATCH 'is_in_range' material=0x..
+[l4n-proxy] 菜单回调：已注册 15 个代理
+[l4n-proxy] engine proxy: 'l4nrp_math' Init material=0x........ per_frame=true
+[l4n-proxy] engine proxy: Release
 [l4n-proxy] is_in_range[vgui/common/l4d_spinner]: $src_var=0.5000 in [$min_var=0.0000,$max_var=1.0000] -> $result_var2=1
 [l4n-proxy] print_variable[vgui/common/l4d_spinner]: $var=0.5000 (float)
 ```
+
+> `engine proxy: '...' Init ...` 每出现一次，就代表引擎在自己的 VMT 解析过程中实例化了一个 `l4nrp_*` 代理；
+> 若 VMT 里写错了代理名，引擎会在控制台警告 `proxy not found`（本插件不会再拦截这类名字）。
 
 ## 开发者：如何新增一个代理
 
@@ -205,3 +212,17 @@ LessOrEqual:  srcVar1 <= srcVar2 ? LessEqualVar : greaterVar
 1. 新建一个 struct 实现 [`Proxy`](src/kv.rs) trait：`apply_kv` 填参数、`bind` 执行动作、`per_frame` 决定是否每帧执行；
 2. 在 [`lib.rs`](src/lib.rs) 里用 `material::register_proxy::<T>("代理名")` 注册；
 3. 在 VMT 的 `"Proxies"` 块里写上该代理名即可。
+
+注册表会在 `OnModuleLoaded("client")` 时整体通过 `AddProxy` 写进引擎的 `CMaterialProxyDict`，
+所以新增代理不需要改任何引擎侧的地址或 hook —— 加一行 `register_proxy` 就够了。
+
+## 实现说明
+
+- 代理是**引擎原生代理**：插件在 `OnModuleLoaded("client")` 时取到 `client.dll` 的
+  `CMaterialProxyDict` 单例，为每个 `l4nrp_*` 调一次 `AddProxy(name, createFn)`；
+  之后引擎解析 VMT 时会调 `createFn` 得到插件的代理对象，再调它的 `Init(name, kv)` 注入参数。
+- **每帧执行**靠 hook D3D9 的 `EndScene`（vtable 索引 42）：`Init` 里把 `per_frame()` 为真的代理
+  登记进活动表，`EndScene` 每帧对它们执行 `bind`。引擎的 `OnBind` 实测**不会被调用**，且材质
+  bind 的频率低于帧率，所以不走那条路。
+- 逆向依据（工厂地址、`Init` 真实 ABI、`ProxyObject` vtable 布局、堆归属处理等）见
+  [`AGENTS.md`](AGENTS.md)。
