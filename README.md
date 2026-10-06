@@ -221,8 +221,9 @@ LessOrEqual:  srcVar1 <= srcVar2 ? LessEqualVar : greaterVar
 - 代理是**引擎原生代理**：插件在 `OnModuleLoaded("client")` 时取到 `client.dll` 的
   `CMaterialProxyDict` 单例，为每个 `l4nrp_*` 调一次 `AddProxy(name, createFn)`；
   之后引擎解析 VMT 时会调 `createFn` 得到插件的代理对象，再调它的 `Init(name, kv)` 注入参数。
-- **每帧执行**靠 hook D3D9 的 `EndScene`（vtable 索引 42）：`Init` 里把 `per_frame()` 为真的代理
-  登记进活动表，`EndScene` 每帧对它们执行 `bind`。引擎的 `OnBind` 实测**不会被调用**，且材质
-  bind 的频率低于帧率，所以不走那条路。
+- **每帧执行靠引擎自己的 `OnBind`（零 hook）**：`per_frame()` 为真的代理直接在代理对象的
+  `OnBind` 槽里执行 —— 引擎每次绑定该材质都会遍历代理数组并调用它。实机实测同一材质约
+  **4.68 次/帧**，15 个代理全部幂等，所以不需要帧计数也不需要 hook。
+  **v0.7.0 起不再 hook D3D9 `EndScene`**（旧方案会与 DXVK / 设备重建耦合）。
 - 逆向依据（工厂地址、`Init` 真实 ABI、`ProxyObject` vtable 布局、堆归属处理等）见
   [`AGENTS.md`](AGENTS.md)。

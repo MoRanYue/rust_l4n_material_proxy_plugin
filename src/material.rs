@@ -1,12 +1,12 @@
 #![allow(dead_code)] // set_int/set_string 等 API 供插件开发者选用
-//! 材质代理：代理注册表、KeyValues 解析、detour hook、D3D EndScene 每帧执行。
+//! 材质代理：代理注册表、KeyValues 解析、引擎原生代理注册、`OnBind` 驱动。
 //! 详细机制 / 逆向依据 / 注意事项见项目根目录 AGENTS.md。
 
 use core::ffi::{c_char, c_void, CStr};
 use core::mem::transmute;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -14,7 +14,6 @@ use std::time::Instant;
 use uuid::Uuid;
 use windows::core::s;
 use windows::Win32::System::LibraryLoader::GetModuleHandleA;
-use windows::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
 
 use crate::error::{MaterialError, PluginError};
 use crate::kv::Proxy;
@@ -273,7 +272,7 @@ static REGISTRY: Mutex<Vec<RegEntry>> = Mutex::new(Vec::new());
 /// 注册一个自定义材质代理：VMT `"Proxies"` 里出现该名字时创建 `P` 实例、
 /// 注入 `"Proxies"` 块参数（`apply_kv`）并调用 `bind(material)`。
 pub fn register_proxy<P: Proxy + Default + 'static>(name: &'static str) -> bool {
-    let mut reg = REGISTRY.lock().unwrap();
+    let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if reg.iter().any(|e| e.name == name) {
         return false;
     }
@@ -285,26 +284,29 @@ pub fn register_proxy<P: Proxy + Default + 'static>(name: &'static str) -> bool 
 }
 
 pub fn proxy_registered(name: &str) -> bool {
-    REGISTRY.lock().unwrap().iter().any(|e| e.name == name)
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|e| e.name == name)
 }
 
 pub fn registered_names() -> Vec<String> {
-    REGISTRY.lock().unwrap().iter().map(|e| e.name.to_string()).collect()
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|e| e.name.to_string()).collect()
 }
 
 // ---------- 引擎侧代理对象（真正注册进 CMaterialProxyDict 的 IMaterialProxy） ----------
-// 逆向依据（详见 AGENTS.md「引擎原生代理注册」）：
+// 逆向依据（详见 AGENTS.md「材质代理注册」）：
 //   * `client.dll` 的 `CMaterialProxyDict`（vtable RVA 0x576d94）只有 3 个槽位：
 //     `[0]` CreateProxy、`[1]` DeleteProxy、`[2]` AddProxy；
 //   * `materialsystem.dll` 的 VMT 解析函数 `FUN_10002d50` 遍历 `"Proxies"` 子键，
-//     对每个键调用 `CreateProxy(名字)`，成功后调用 `Init(IMaterial*, KeyValues*)`；
-//     只有 `Init` 返回 false 才调用 `DeleteProxy` 回收；
-//   * 材质卸载时引擎调用 `Release()`（`AnimatedTexture::Release` 即自调 `vtable[0x10](1)` 自删）。
+//     对每个键调用 `CreateProxy(名字)`，成功后调用 `Init(名字, KeyValues*)`（第 1 参是
+//     名字字符串，不是 IMaterial*）；只有 `Init` 返回 false 才调用 `DeleteProxy` 回收；
+//   * 引擎拆除代理数组时（`FUN_10002ed0`）只倒序对每项调 `factory->vtable[+1](proxy)`，
+//     **从不释放我方对象内存** —— 释放由代理自己负责（引擎自带 `AnimatedTexture::Release`
+//     即自调 `vtable[0x10](1)` 自删），所以本插件用 Rust 分配、也用 Rust 释放。
 // 因此本插件把自己注册成引擎原生代理，不再 detour 引擎解析函数，也不再从
 // `"Proxies"` 块里摘除节点 —— 引擎自己会实例化并驱动我们。
 //
 // vtable 形状对齐 `AnimatedTexture`（client.dll RVA 0x53cb48，7 槽）的前 5 槽；
-// 实测（探针 v5）5 槽即可被引擎正常驱动：Init / OnBind / Release / GetMaterial / 标量删除析构。
+// 实测（探针 v5 + v0.7.0 实机 E2E）5 槽即可被引擎正常驱动：
+// Init / OnBind / Release / GetMaterial / 标量删除析构。
 
 #[repr(C)]
 struct ProxyVtable {
@@ -319,8 +321,10 @@ struct ProxyVtable {
 ///
 /// 由 `l4nrp_create`（`extern "C" fn() -> *mut c_void`）用 Rust 堆分配；引擎只使用首字段的
 /// vtable 指针并调用虚函数，`proxy` 里装着真正的计算逻辑。
-/// 生命周期：`Release()` 只置 `released` 标记，由 `run_active_proxies` 每帧
-/// `purge_released` 统一回收（先摘 `ACTIVE` 再 `Box::from_raw`，避免悬垂）。
+/// 生命周期：创建时登记进 `LIVE`；引擎卸载材质时调 `Release()` → `po_release` **只置标志**
+/// （引擎此刻仍在遍历代理数组，就地释放会造成 use-after-free），真正的摘除与
+/// `Box::from_raw` 由 `purge_released` 完成 —— 它从 `LIVE` 摘除这一步同时充当所有权判定，
+/// 所以引擎重复调用 `Release` / 标量删除析构也不会二次释放。
 #[repr(C)]
 struct ProxyObject {
     vtable: *const ProxyVtable,
@@ -333,10 +337,16 @@ struct ProxyObject {
 // 对象在渲染线程创建、材质卸载时（主线程）Release，指针仅在裸指针语义下传递
 unsafe impl Send for ProxyObject {}
 
-/// 所有存活对象的登记表（用于每帧回收已 `Release` 的对象）。
+/// 所有存活对象的登记表（`Release` 时据此判定所有权，避免重复释放）。
 struct LiveList(Vec<*mut ProxyObject>);
 unsafe impl Send for LiveList {}
 static LIVE: Mutex<LiveList> = Mutex::new(LiveList(Vec::new()));
+
+/// 已被引擎 `Release`、等待回收的对象数量。
+///
+/// `po_on_bind` 每帧被调数百次，若每次都去锁 `LIVE` 做一遍扫描会造成无谓争用；
+/// 这个计数为零时直接跳过扫描（只作快速路径判据，真值始终以 `LIVE` 为准）。
+static PENDING_RELEASE: AtomicUsize = AtomicUsize::new(0);
 
 static PROXY_VTABLE: ProxyVtable = ProxyVtable {
     init: po_init,
@@ -409,27 +419,91 @@ unsafe extern "thiscall" fn po_init(
     if let Some(e) = bind_err {
         crate::log(&format!("engine proxy: '{name}' initial bind failed: {e}"));
     }
-    if per_frame {
-        register_active(this, material);
-    }
     1
 }
 
-/// 引擎在材质每次绑定时调用。本插件仍在 D3D `EndScene` 里驱动 per-frame 代理
-/// （`l4nrp_delay_set` 的计时器需要每帧心跳，不能只在材质被渲染时才跑），故此处空转。
-unsafe extern "thiscall" fn po_on_bind(_this: *mut ProxyObject, _entity: *mut c_void) {
-    // 刻意留空：per-frame 代理仍由 D3D `EndScene` hook 驱动（见 `run_active_proxies`），
-    // `l4nrp_delay_set` 的计时器依赖那个每帧心跳。引擎只在材质 bind 时调本槽，
-    // 用它驱动会漏帧，故不在此处执行 bind。
+/// 引擎在材质每次绑定时调用（`CMaterial::vtable[0xd0]` = materialsystem RVA 0x4970 遍历
+/// `material+0x28` 的代理数组，逐个 `proxy->vtable[+4](entity)`）。
+///
+/// 路线 A：per-frame 代理直接在这里跑，不再 hook D3D `EndScene`。
+/// 实测（探针 v5，8100 帧）本槽对同一材质被调 ~4.68 次/帧，一帧内会重复执行；
+/// 15 个代理全部幂等（纯函数读-算-写，或基于边沿检测），故无需按帧去重。
+/// `run_timers()` 也挂在这里：计时器精度取决于材质绑定频率，未绑定期间会顺延。
+unsafe extern "thiscall" fn po_on_bind(this: *mut ProxyObject, _entity: *mut c_void) {
+    if this.is_null() {
+        return;
+    }
+    // 顺序要紧：先判本对象是否已被 Release。`purge_released()` 会把已 Release 的对象
+    // 释放掉，若 `this` 恰在其中，先在它之后读 `this` 就是 use-after-free。
+    if (*this).released.load(Ordering::Acquire) {
+        return;
+    }
+    // 回收引擎已 Release、但本帧还没被回收的对象。回收点不落在 `Release` 内部：
+    // 那时引擎仍在代理数组的拆除循环里，释放会让它继续触碰已释放内存（见 `po_release`）。
+    purge_released();
+    run_timers();
+    let Some(proxy) = (*this).proxy.as_mut() else {
+        return;
+    };
+    if !proxy.per_frame() {
+        return;
+    }
+    let material = (*this).material;
+    if let Err(e) = proxy.bind(material) {
+        crate::log(&format!(
+            "engine proxy: OnBind bind failed material=0x{:x}: {e}",
+            material.addr()
+        ));
+    }
 }
 
-/// 引擎在材质卸载时调用：只打标记，实际回收交给 `run_active_proxies`（见 `ProxyObject`）。
+/// 引擎在材质卸载时调用（`proxy->vtable[+8]`）。
+///
+/// 只打标记，**不在这里释放**：`Release` 由引擎在代理数组的拆除循环里调用
+/// （`FUN_10002ed0` 倒序对每项调 `factory->vtable[+1](proxy)`），此时释放会让引擎
+/// 在本次调用栈上继续触碰已释放内存。真正回收交给 [`purge_released`]。
 unsafe extern "thiscall" fn po_release(this: *mut ProxyObject) {
     if this.is_null() {
         return;
     }
+    // 只在「首次」Release 时递增待回收计数：引擎可能对同一对象重复调用（Release
+    // 与标量删除析构都会走到这里），重复递增会让快速路径永远失效。
     if !(*this).released.swap(true, Ordering::AcqRel) {
-        crate::log("engine proxy: Release");
+        PENDING_RELEASE.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// 回收所有已被引擎 `Release` 的对象：先从 `LIVE` 摘除（持锁），再在锁外 `Box::from_raw`。
+///
+/// 「摘除」这一步同时充当所有权判定 —— 只有真正摘到条目的那次才释放，
+/// 因此引擎重复调用 `Release`/标量删除析构也不会二次释放。
+unsafe fn purge_released() {
+    // 快速路径：无待回收对象时完全不动 `LIVE` 锁（`po_on_bind` 每帧数百次调用）。
+    if PENDING_RELEASE.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let mut dead: Vec<*mut ProxyObject> = Vec::new();
+    {
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        live.0.retain(|p| {
+            // SAFETY: `LIVE` 里的指针都由 `l4nrp_create` 经 `Box::into_raw` 产生，
+            // 在摘除之前始终有效。
+            if unsafe { (**p).released.load(Ordering::Acquire) } {
+                dead.push(*p);
+                false
+            }
+            else {
+                true
+            }
+        });
+    }
+    if !dead.is_empty() {
+        PENDING_RELEASE.fetch_sub(dead.len(), Ordering::AcqRel);
+    }
+    // 锁外释放：析构 `ProxyObject` 会 drop 代理（DelaySetProxy::Drop 还要碰 TIMERS），
+    // 持 LIVE 锁做这件事会引入不必要的锁序耦合。
+    for p in dead {
+        drop(Box::from_raw(p));
     }
 }
 
@@ -442,8 +516,8 @@ unsafe extern "thiscall" fn po_get_material(this: *mut ProxyObject) -> *mut c_vo
     }
 }
 
-/// 标量删除析构：引擎正常路径不会调用（我们总是让 `Init` 返回 true），
-/// 真被调用时同样只打标记，交给每帧回收，避免二次释放。
+/// 标量删除析构：与 `Release` 同样只打标记（引擎自带代理用它做自删，我们统一走
+/// `po_release` + `purge_released` 的延迟回收，避免在引擎调用栈上释放内存）。
 unsafe extern "thiscall" fn po_scalar_deleting_dtor(this: *mut ProxyObject, _flags: u32) {
     po_release(this);
 }
@@ -477,93 +551,6 @@ pub unsafe fn register_engine_proxies() -> Result<usize, PluginError> {
     Ok(n)
 }
 
-// ---------- 每帧执行（D3D EndScene 触发） ----------
-struct ActiveProxy {
-    // 唯一 id：同一材质可注册多个 per-frame 代理（各自独立条目，参数隔离）
-    id: u64,
-    /// 拥有该条目的引擎侧代理对象（`l4nrp_create` 分配，`Release` 后由 purge 回收）。
-    owner: *mut ProxyObject,
-    material: *mut c_void,
-}
-// material 指针仅在渲染线程内使用，手动标记 Send 以放入 Mutex
-unsafe impl Send for ActiveProxy {}
-static ACTIVE: Mutex<Vec<ActiveProxy>> = Mutex::new(Vec::new());
-static NEXT_ACTIVE_ID: AtomicU64 = AtomicU64::new(1);
-
-/// 登记一个需每帧执行的代理（引擎 `Init` 里调用，`owner` 即该引擎代理对象）。
-/// 同一材质可注册多个不同代理（各自独立条目）；**不能按材质去重**，否则同一材质上
-/// 多个 per-frame 代理只会保留最后一个（曾导致 `l4nrp_print_variable` 被
-/// `l4nrp_is_in_range` 替换而不执行，见 AGENTS.md 已知问题）。
-unsafe fn register_active(owner: *mut ProxyObject, material: *mut c_void) {
-    let mut a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let id = NEXT_ACTIVE_ID.fetch_add(1, Ordering::Relaxed);
-    a.push(ActiveProxy { id, owner, material });
-}
-
-/// 回收已被引擎 `Release` 的代理对象：先从 `ACTIVE` 摘除条目，再释放内存。
-/// 锁序固定为 `LIVE → ACTIVE`（`register_active` 只取 `ACTIVE`，不反向）。
-fn purge_released() {
-    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut keep: Vec<*mut ProxyObject> = Vec::with_capacity(live.0.len());
-    for &p in live.0.iter() {
-        if p.is_null() {
-            continue;
-        }
-        if unsafe { (*p).released.load(Ordering::Acquire) } {
-            {
-                let mut a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-                a.retain(|e| e.owner != p);
-            }
-            // SAFETY: 指针来自 `l4nrp_create` 的 `Box::into_raw`；本函数在本帧 items 快照
-            // 之前运行，且已摘除全部指向它的 ACTIVE 条目 —— 此刻无人使用。
-            unsafe { drop(Box::from_raw(p)) };
-        }
-        else {
-            keep.push(p);
-        }
-    }
-    live.0 = keep;
-}
-
-/// D3D 每帧回调：先回收引擎已 `Release` 的对象，再对所有活动代理执行 `bind`
-/// （读当前材质变量 → 计算 → 写回）。
-/// 注意：须先复制指针并释放 `ACTIVE` 锁再逐个 `bind`，避免锁重入死锁（见 AGENTS.md）。
-pub fn run_active_proxies() {
-    // 先触发到期的计时器（l4nrp_delay_set 生成的）
-    run_timers();
-    // 回收引擎已 Release 的对象（必须在生成 items 快照之前，避免用到已释放内存）
-    purge_released();
-    let items: Vec<(u64, *mut c_void, *mut ProxyObject)> = {
-        let a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-        a.iter().map(|e| (e.id, e.material, e.owner)).collect()
-    };
-    // bind 返回 Err = 材质失效/变量缺失 → 从活动表移除该条目
-    let mut stale: Vec<u64> = Vec::new();
-    for (id, m, owner) in items {
-        if owner.is_null() {
-            stale.push(id);
-            continue;
-        }
-        // SAFETY: owner 由 `purge_released` 保证存活（已 Release 的在本帧开始时被摘除/释放）
-        let obj = unsafe { &mut *owner };
-        let Some(proxy) = obj.proxy.as_mut() else {
-            stale.push(id);
-            continue;
-        };
-        if let Err(e) = unsafe { proxy.bind(m) } {
-            crate::log(&format!(
-                "material '{}' error: {}",
-                unsafe { get_name(m) }.unwrap_or("?".into()), e
-            ));
-            stale.push(id);
-        }
-    }
-    if !stale.is_empty() {
-        let mut a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-        a.retain(|e| !stale.contains(&e.id));
-    }
-}
-
 // ---------- 计时器注册表（l4nrp_delay_set 生成 / l4nrp_delay_abort 中断） ----------
 struct ActiveTimer {
     // 注：handle 不存于此（作为 HashMap 的 key，见 TIMERS）
@@ -579,6 +566,10 @@ unsafe impl Send for ActiveTimer {}
 static TIMERS: LazyLock<Mutex<HashMap<String, ActiveTimer>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// `TIMERS` 中的条目数。`run_timers` 每帧被调数百次，这个计数为零时直接跳过锁
+/// （绝大多数材质根本不用 `l4nrp_delay_set`）；真值始终以 `TIMERS` 为准。
+static TIMER_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// 启动一个计时器：`delay_ms` 后（由 `run_timers` 每帧触发）把 `value`（触发时快照的**整型值**）
 /// 写入 `output`。返回 **UUID v4 字符串手柄**，供中断/查询。
 ///
@@ -586,36 +577,53 @@ static TIMERS: LazyLock<Mutex<HashMap<String, ActiveTimer>>> =
 /// 延迟期间源变量再变化不影响本次输出。
 pub fn start_timer(material: *mut c_void, output_n: CString, value: i32, delay_ms: u64) -> String {
     let h = Uuid::new_v4().to_string();
-    let mut ts = TIMERS.lock().unwrap();
+    // 锁中毒一律恢复内部值：panic="abort" 下 poison panic 会直接崩掉游戏（见 AGENTS.md）
+    let mut ts = TIMERS.lock().unwrap_or_else(|e| e.into_inner());
     ts.insert(h.clone(), ActiveTimer {
         material,
         output_n,
         value,
         end: Instant::now() + std::time::Duration::from_millis(delay_ms),
     });
+    TIMER_COUNT.store(ts.len(), Ordering::Release);
     h
 }
 
 /// 按手柄（UUID v4 字符串）中断计时器。返回是否找到并移除。
 pub fn abort_timer(handle: &str) -> bool {
-    TIMERS.lock().unwrap().remove(handle).is_some()
+    let mut ts = TIMERS.lock().unwrap_or_else(|e| e.into_inner());
+    let removed = ts.remove(handle).is_some();
+    TIMER_COUNT.store(ts.len(), Ordering::Release);
+    removed
 }
 
 /// 指定手柄的计时器是否仍在运行。
 pub fn timer_active(handle: &str) -> bool {
-    TIMERS.lock().unwrap().contains_key(handle)
+    TIMERS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(handle)
 }
 
-/// 每帧触发到期的计时器：把触发时快照的整型值 `value` 写入 `output` 并移除。
+/// 触发到期的计时器：把触发时快照的整型值 `value` 写入 `output` 并移除。
 /// 先取出到期项再释放锁执行，避免持锁调用引擎（见 AGENTS.md 锁注意事项）。
+///
+/// 路线 A 下由 `po_on_bind` 驱动，即精度取决于材质绑定频率（实测 ~4.68 次/帧）；
+/// 材质未被绑定期间计时器不会到期，会在下次绑定时立即补触发。
 fn run_timers() {
+    // 快速路径：没有计时器时完全不动 `TIMERS` 锁（`po_on_bind` 每帧数百次调用，
+    // 而绝大多数材质并不使用 `l4nrp_delay_set`）。
+    if TIMER_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
     // extract_if：持锁消费掉到期条目，key/value 所有权移出（零复制），
-    // 无 Key 克隆、无中间集合分配。语句结束即释放锁，随后在锁外执行引擎写入。
+    // 无 Key 克隆、无中间集合分配。块结束即释放锁，随后在锁外执行引擎写入。
     let now = Instant::now();
-    let fired: Vec<ActiveTimer> = TIMERS.lock().unwrap()
-        .extract_if(|_, t| now >= t.end)
-        .map(|(_, t)| t)
-        .collect();
+    let (fired, left): (Vec<ActiveTimer>, usize) = {
+        let mut ts = TIMERS.lock().unwrap_or_else(|e| e.into_inner());
+        let fired: Vec<ActiveTimer> = ts.extract_if(|_, t| now >= t.end).map(|(_, t)| t).collect();
+        (fired, ts.len())
+    };
+    if !fired.is_empty() {
+        TIMER_COUNT.store(left, Ordering::Release);
+    }
     for t in fired {
         // 防悬垂：材质已不可读（被引擎卸载/替换）则丢弃该计时器，避免解引用坏指针崩溃
         if crate::kv::test_readable(t.material).is_err() {
@@ -690,67 +698,3 @@ unsafe fn parse_proxy_params(proxy: &mut dyn Proxy, node: *mut c_void) {
     }
 }
 
-// ---------- D3D9 EndScene 每帧 hook（执行活动代理） ----------
-// D3D9 COM 方法为 __stdcall，故 hook 用 extern "system"（见 AGENTS.md）
-/// 原 EndScene 函数地址（来自 D3D vtable 槽，是外部函数指针，无 `&raw` 来源）。
-static mut ORIGINAL_ENDSCENE: usize = 0;
-/// 被我们改写的 vtable 槽（带 provenance，用于 `uninstall` 还原）。
-static mut HOOKED_ENDSCENE_SLOT: *mut usize = core::ptr::null_mut();
-
-type EndSceneFn = unsafe extern "system" fn(*mut c_void) -> i32;
-
-unsafe extern "system" fn endscene_hook(this: *mut c_void) -> i32 {
-    // 每帧：先执行活动代理，再透传原 EndScene
-    run_active_proxies();
-    let orig: EndSceneFn = transmute((&raw const ORIGINAL_ENDSCENE).read());
-    orig(this)
-}
-
-/// patch D3D9 `IDirect3DDevice9::EndScene`（vtable 索引 42），每帧先执行活动代理再透传原函数。
-pub unsafe fn install_d3d_endscene(device: *mut c_void) -> Result<(), PluginError> {
-    if device.is_null() {
-        return Err(PluginError::Unexpected(Box::from("Direct3D device not ready")));
-    }
-    // COM 对象首字段是 vtable 指针；用 `&raw const` 读取，不构造引用
-    let vft: *const usize = *(&raw const *device).cast::<*const usize>();
-    if vft.is_null() {
-        return Err(PluginError::Unexpected(Box::from("Direct3D device not ready")));
-    }
-    // vtable 槽存的是函数地址（外部函数指针，无 `&raw` 来源）：读写全程用 usize，
-    // 不把它当成可解引用的指针来回 cast。
-    let slot: *mut usize = vft.add(42).cast_mut();
-    let orig = *slot;
-    let hook_addr = (endscene_hook as *const ()).addr();
-    if orig == 0 || orig == hook_addr {
-        return Err(PluginError::Unexpected(Box::from("IDirect3DDevice9::EndScene does not exist")));
-    }
-    let mut old = std::mem::zeroed();
-    VirtualProtect(slot.cast(), 4, PAGE_EXECUTE_READWRITE, &mut old)?;
-    ORIGINAL_ENDSCENE = orig;
-    HOOKED_ENDSCENE_SLOT = slot;
-    *slot = hook_addr;
-    let mut t = std::mem::zeroed();
-    VirtualProtect(slot.cast(), 4, old, &mut t).ok();
-
-    Ok(())
-}
-
-/// 还原 `EndScene` vtable 槽（插件析构时调用）。
-///
-/// 引擎原生代理注册（`CMaterialProxyDict::AddProxy`）**无法撤销**：该工厂只有
-/// CreateProxy / DeleteProxy / AddProxy 三个槽位，没有删除名字的接口；已实例化的
-/// 代理对象也由引擎按材质生命周期调用 `Release()` 回收（见 `purge_released`）。
-/// 因此这里只还原我们自己 patch 的 D3D vtable 槽。
-pub unsafe fn uninstall() {
-    let slot = (&raw const HOOKED_ENDSCENE_SLOT).read();
-    if slot.is_null() {
-        return;
-    }
-    let orig = (&raw const ORIGINAL_ENDSCENE).read();
-    let mut old = std::mem::zeroed();
-    VirtualProtect(slot.cast(), 4, PAGE_EXECUTE_READWRITE, &mut old).ok();
-    *slot = orig;
-    let mut t = std::mem::zeroed();
-    let _ = VirtualProtect(slot.cast(), 4, old, &mut t);
-    HOOKED_ENDSCENE_SLOT = core::ptr::null_mut();
-}

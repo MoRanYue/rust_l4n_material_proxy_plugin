@@ -20,10 +20,10 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 
 | 文件 | 职责 |
 |---|---|
-| [`src/lib.rs`](src/lib.rs) | 插件入口：IL4NPlugin 虚表/实现、注册与 hook 安装时序 |
+| [`src/lib.rs`](src/lib.rs) | 插件入口：IL4NPlugin 虚表/实现、注册与安装时序 |
 | [`src/engine.rs`](src/engine.rs) | IMaterialSystem 绑定 + `client.dll` 的 `CMaterialProxyDict` 工厂（`material_proxy_factory` / `add_material_proxy`） |
 | [`src/kv.rs`](src/kv.rs) | `Proxy` trait 定义 + 内存可读性检查（`is_readable`） |
-| [`src/material.rs`](src/material.rs) | 代理注册表、引擎侧 `ProxyObject`（7 槽 vtable）、KeyValues 参数解析、D3D EndScene 每帧执行 |
+| [`src/material.rs`](src/material.rs) | 代理注册表、引擎侧 `ProxyObject`（5 槽 vtable）、KeyValues 参数解析、`OnBind` 驱动的每帧执行、延迟计时器 |
 | [`src/menu.rs`](src/menu.rs) | L4N 接口 v2 的 HUD 菜单（`RequestHudMenu`）：标题、KV 菜单结构、`callback` 子菜单 |
 | [`src/util.rs`](src/util.rs) | 通用小工具：`RelativeCompare`（f32 相对比较，容差 1e-6），供比较类代理复用 |
 | [`src/expr.rs`](src/expr.rs) | 表达式求值器（无依赖）：数学 + 比较（`== != < <= > >=`）+ 逻辑（`&& \|\| !`），供 `l4nrp_math` / `l4nrp_logic` 使用 |
@@ -105,8 +105,8 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 2. 对注册表里每个代理名 `AddProxy(name, l4nrp_create)` —— 名字 `Box::leak` 故意泄漏
    （`AddProxy` 是否复制名字未验证）；`create_fn` 全部指向同一个 `l4nrp_create`；
 3. 引擎解析 VMT `"Proxies"` 块时调 `CreateProxy(name)` → 得到我们的 `ProxyObject` → 调
-   `Init(name, kv)` → 我们在 `Init` 里查 `REGISTRY`、`apply_kv` 注入参数、`bind` 一次，
-   并把 `per_frame()` 为真的代理登记进活动表。
+   `Init(name, kv)` → 我们在 `Init` 里查 `REGISTRY`、`apply_kv` 注入参数、`bind` 一次；
+   `per_frame()` 为真的代理**不再单独登记**，改由引擎后续的 `OnBind` 调用驱动（见下）。
 
 **因此 `l4n_is_proxy_exist` 现在能查到 `l4nrp_*`**（实机验证过，见下）。
 
@@ -137,26 +137,72 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 
 ### 我们的 `ProxyObject`（`src/material.rs`）
 
-7 槽 vtable，对齐 `AnimatedTexture`（`client.dll` RVA `0x53cb48`）实测布局：
+**5 槽** vtable，对齐 `AnimatedTexture`（`client.dll` RVA `0x53cb48`，共 7 槽）**实测被引擎用到的前 5 槽**：
 
 | 槽 | 字节偏移 | 我们的实现 | 语义 |
 |---|---|---|---|
 | 0 | `+0x00` | `po_init` | `Init(name, kv)`，`RET 0x8`，恒返回 1 |
-| 1 | `+0x04` | `po_on_bind` | 空实现（per-frame 仍由 EndScene 驱动） |
-| 2 | `+0x08` | `po_release` | 置 `released` 标志，供 `purge_released` 回收 |
+| 1 | `+0x04` | `po_on_bind` | **per-frame 代理在此执行**（路线 A，见下） |
+| 2 | `+0x08` | `po_release` | 置 `released` 标志 + 递增 `PENDING_RELEASE`，供 `purge_released` 回收 |
 | 3 | `+0x0c` | `po_get_material` | 返回 `(*this).material` |
-| 4 | `+0x10` | `po_scalar_deleting_dtor` | 标量删除析构，`RET 0x4` |
-| 5 | `+0x14` | `po_noop_float` | 返回 `0.0f` |
-| 6 | `+0x18` | `po_noop` | 空实现 |
+| 4 | `+0x10` | `po_scalar_deleting_dtor` | 标量删除析构（`RET 0x4`），与 `Release` 同样只置标志 |
 
-- **对象内存由 `Box::into_raw` 分配**（Rust 全局分配器）。引擎的 `Release()` 走
-  `AnimatedTexture` 的 `0x1000e5f0` 模式 —— `if (this) this->vtable[0x10](1)` → 标量删除析构 →
-  **`client.dll` 的 `operator delete`（RVA `0x100011f0`）**。为避免「Rust 分配 / MSVC 释放」的
-  堆不匹配，我们**不实现真正的释放**：`po_scalar_deleting_dtor` 只置 `released` 标志，
-  真正的 `Box::from_raw` 由 `purge_released()` 在下一帧完成。
-- `LIVE` 表保存全部已创建对象指针；`ACTIVE` 表保存需要每帧 `bind` 的条目
-  （`ActiveProxy { id, owner, material }`），`owner` 指回 `ProxyObject`，`Release` 后由
-  `purge_released()` 一并回收。锁序固定 `LIVE → ACTIVE`。
+> 只用 5 槽是**实测结论**（探针 v5 + v0.7.0 实机 E2E 均正常驱动），不是假设。`AnimatedTexture`
+> 多出的槽 5（`0x1000e7e0` = `FLDZ; RET 0x4`，返 `0.0f`）与槽 6（`0x1000e7f0`，KV 风格 getter）
+> **引擎从未在代理分发路径上调用过** —— 若将来出现未解释的崩溃，这是第一个要补的地方。
+
+- **对象内存由 `Box::into_raw` 分配**（Rust 全局分配器）。**引擎从不释放我方对象** ——
+  `FUN_10002ed0`（`materialsystem.dll`，代理数组拆除）只是倒序对每项调
+  `factory->vtable[+1](proxy)`（`DeleteProxy` 槽），把释放交给代理自己；代理指针数组本身
+  才由引擎用 `g_pMemAlloc` 释放。因此分配/释放两端都在本插件手里，不存在堆不匹配。
+- **`po_release` 只打标记，绝不就地释放**：它由引擎在拆除循环内调用，那一刻引擎仍持有该对象
+  （循环还要继续），就地 `Box::from_raw` 会让引擎继续触碰已释放内存。真正的释放由
+  `purge_released()` 完成 —— 它先从 `LIVE` 摘除（**摘除这一步同时充当所有权判定**，
+  所以引擎重复调用 `Release` / 标量删除析构也不会二次释放），再在**锁外** `Box::from_raw`。
+- `LIVE` 表保存全部已创建对象指针；`PENDING_RELEASE` 是「已 `Release`、待回收」的计数，
+  用于让 `po_on_bind`（每帧数百次调用）在无待回收项时**完全不碰 `LIVE` 锁**。
+
+### 每帧执行：`OnBind` 驱动（路线 A，无 D3D hook）
+
+`per_frame()` 为真的代理**直接在槽 1 `po_on_bind` 里执行** —— 引擎每次绑定该材质都会遍历
+代理数组并调用 `proxy->vtable[+4](entity)`，这就是每帧驱动，无需任何 hook：
+
+```rust
+if this.is_null() { return; }
+// 顺序要紧：purge_released() 会释放已 Release 的对象，若 this 在其中，
+// 先 purge 再读 this 就是 use-after-free —— 所以先自判。
+if (*this).released.load(Ordering::Acquire) { return; }
+purge_released();
+run_timers();
+let Some(proxy) = (*this).proxy.as_mut() else { return; };
+if !proxy.per_frame() { return; }
+proxy.bind((*this).material);
+```
+
+- **不做按帧去重**：实测该槽对同一材质约 **4.68 次/帧**（8100 帧内 37916 次），一帧内会重复
+  执行。全部 15 个代理都幂等（纯函数读-算-写，或基于边沿检测），因此重复执行等价 ——
+  这正是不需要帧计数器、不需要 hook 的前提。
+- **`run_timers()` 也挂在这里**：计时器精度取决于材质绑定频率；材质**未被绑定期间计时器不会
+  到期**，会在下次绑定时立即补触发（`l4nrp_delay_set` 的语义因此是「绑定驱动的延迟」）。
+- **两点快速路径**（`po_on_bind` 是热路径）：`PENDING_RELEASE == 0` 时 `purge_released` 直接
+  返回；`TIMER_COUNT == 0` 时 `run_timers` 直接返回。绝大多数材质两者都是 0，热路径上
+  **零锁开销**。
+
+> **为什么最终能用 `OnBind`**：早期实测「`po_on_bind` 命中 0 次」是**测试材质从未被渲染**导致
+> 的假阴性（当时用 `l4n/neko_tonemap` 做载体，而该材质从不进入引擎的代理分发列表）。
+> 改用真实会被绑定的材质（`models/weapons/melee/crowbar`）后，计数稳定逐帧递增
+> （实测 28995 帧 / 4828 帧两次运行，见「端到端实机验证记录」）。
+
+> **旧结论已作废**：曾用 D3D9 `EndScene` hook（vtable 索引 42）驱动每帧，理由是「引擎从不调用
+> 我方 `OnBind`，且材质 bind 频率低于帧率会漏帧」。前半句是上述假阴性；后半句在路线 A 下
+> **不再是问题** —— 代理本就只对「正在被绑定的材质」有意义，未被绑定的材质不需要每帧更新。
+> EndScene 路线还带来 DXVK / 设备重建耦合（`is_dxvk=true` 时尤其脆），已整体移除。
+
+> **路线 B（未采用）**：改挂 `CMaterialSystem::BeginFrame`（vtable 槽 32 / 字节 `0x80`）或
+> `EndFrame`（槽 37 / 字节 `0x94`）。比 EndScene 干净（脱离 D3D/DXVK，且 `BeginFrame`/`EndFrame`
+> 是每帧恰好一次的语义），但仍是 vtable patch，且对未被绑定的材质做无谓计算。SDK 头已核对：
+> `IMaterialSystem` 没有任何每帧回调或代理分发接口（`FrameSync` 系列在 `materialsystem.dll` 里
+> 也不存在），所以「完全零 hook 的每帧全局回调」不存在。
 
 ### 与内置代理共存
 
@@ -208,38 +254,38 @@ Rust 回调，回调内可读写该材质的 VMT 变量（变色、比较运算�
 > 变量类型只在「按字符串读」时才有区别。`l4nrp_random` 的 `read_number` 因此以
 > `get_float` 为主、`get_int` 仅作异常兜底。
 
-## 每帧执行（D3D9 EndScene hook）
+## 每帧执行
 
-引擎只在材质 bind 时调代理的 `OnBind`，而 `per_frame()` 代理依赖每帧输入（如 `Sine` 输出）。
-因此插件 **hook D3D9 `EndScene`（vtable 索引 42）**：`po_init` 把 `per_frame() == true` 的代理
-连同材质指针登记进活动表，`EndScene` 每帧对它们再次执行 `bind`。
+每帧驱动已改为 **`OnBind` 驱动（路线 A，零 hook）**，详见上文「每帧执行：`OnBind` 驱动」小节。
 
-> **D3D9 COM 方法为 `__stdcall`**（逆向依据：`ghidra_d3d.txt`，left4neko Present hook
-> `LAB_100a8b90`：this 从栈取、`RET n` 清栈），故 EndScene hook 用 `extern "system"`（x86 即 stdcall），
-> **不能用 thiscall**。
-
-> **为什么不用引擎的 `OnBind`**：实机验证显示引擎**从不调用**我们对象的 `OnBind`
-> （`po_on_bind` 命中 0 次），且材质 bind 的频率低于帧率，会漏帧。EndScene 路线已被实测证明
-> 与帧计数严格同步（见下）。
+> **v0.7.0 起不再有 D3D9 `EndScene` hook**，也不再有 `ACTIVE` 活动表与 `run_active_proxies`。
+> 每帧入口是 `ProxyObject` 的槽 1 `po_on_bind`（由引擎在每次绑定该材质时调用），
+> `per_frame()` 的判断也随之从「登记进活动表」改为**在 `po_on_bind` 内按需判断**。
+> 历史记录（EndScene hook 的 D3D9 `__stdcall` 约定等）保留在本文「历史方案」节。
 
 ## 线程 / 锁 / 内存安全注意事项
 
-- **Mutex 重入死锁**：`run_active_proxies` 必须**先复制 (material, owner 指针) 并释放 `ACTIVE` 锁**，
-  再逐个 `bind`。若持有锁期间 `bind` 经引擎回调（如创意工坊 Mod 刷新材质 → `po_init` →
-  `register_active`）再次对 `ACTIVE` 加锁，会造成 `std::sync::Mutex` 重入死锁（表现为"无响应"）。
-- **`ActiveProxy` 手动 `unsafe impl Send`**：`material` 指针仅在渲染线程内传递与使用（不跨线程拥有）。
-- **`bind` 返回 `Err` = 材质失效/所需变量缺失** → 调用方从活动表移除该代理（防止悬垂 + 引擎
-  `FindVar` 警告刷屏）。
+- **`LIVE`（存活对象登记表）与 `PENDING_RELEASE`（待回收计数）**：
+  `l4nrp_create` 在创建时登记进 `LIVE`；`po_release` 只置 `released` 标志并递增
+  `PENDING_RELEASE`；`purge_released()`（由 `po_on_bind` 在热路径上调用）负责摘除与释放。
+- **`po_on_bind` 内语句顺序是安全关键**：必须**先**判 `(*this).released` 再调
+  `purge_released()` —— 后者可能把 `this` 释放掉，反过来就是 use-after-free。
+- **绝不持有锁调用代理 `bind`**：`purge_released` 先在锁内摘出待回收列表、**出锁后**才
+  `Box::from_raw`；`run_timers` 同样先在锁内提取到期计时器、出锁后再执行。
+  若持锁期间 `bind` 经引擎回调再次加锁，会造成 `std::sync::Mutex` 重入死锁（表现为"无响应"）。
+- **`bind` 返回 `Err` = 材质失效/所需变量缺失** → 记一条日志后跳过本次；`OnBind` 路径下
+  不再有活动表可摘除（代理的生命周期完全由引擎的 `Release` 决定）。
 - **读指针前先 `is_readable` 检查**（`VirtualQuery`）：防止 `strlen`/`CStr` 读到坏指针崩溃。
   `is_readable` 复用 32 位 `MEMORY_BASIC_INFORMATION` 布局（`Mbi32`，x86）。
-- **堆归属**：`ProxyObject` 由 Rust 全局分配器（`Box::into_raw`）分配，而引擎的 `Release()` 路径
-  最终会走到 **`client.dll` 的 `operator delete`**。因此 `po_scalar_deleting_dtor` **只置标志、
-  不释放**，真正的 `Box::from_raw` 由 `purge_released()` 在下一帧完成 —— 绝不能把
-  `operator delete` 当成 Rust 的释放器用。
-- **`LIVE` / `ACTIVE` 锁序固定 `LIVE → ACTIVE`**：`purge_released` 持 `LIVE` 时再取 `ACTIVE`；
-  `register_active` 只取 `ACTIVE`，不反向，故无死锁。
+- **堆归属**：`ProxyObject` 由 Rust 全局分配器（`Box::into_raw`）分配，也由 Rust
+  （`purge_released` 的 `Box::from_raw`）释放 —— **引擎从不释放我方对象**（见上文），
+  所以不存在「Rust 分配 / MSVC 释放」的堆不匹配。
+- **两条零锁快速路径**：`PENDING_RELEASE == 0` 时 `purge_released` 直接返回；
+  `TIMER_COUNT == 0` 时 `run_timers` 直接返回。这两条计数只作快路径判据，
+  真值始终以 `LIVE` / `TIMERS` 为准。
 - **`Mutex` 一律用 `unwrap_or_else(|e| e.into_inner())`**：`panic = "abort"` 下 `.unwrap()` 的
-  poison panic 会直接让游戏崩溃。`REGISTRY` / `TIMERS` 等既有处仍是 `.unwrap()`（历史遗留）。
+  poison panic 会直接让游戏崩溃。**v0.7.0 已把 `REGISTRY` / `LIVE` / `TIMERS` 全部改为
+  `unwrap_or_else`**（历史遗留已清理）。
 
 ## 裸指针创建约定（Strict Provenance）
 
@@ -288,7 +334,7 @@ cargo build --release   # 当前 0 命中
 
 - 每个代理独立 struct（参数隔离），实现 [`Proxy`](src/kv.rs) trait：
   - `apply_kv(name, value)`：`"Proxies"` 块参数填充（参数名不区分大小写）
-  - `bind(material)`：读写材质 VMT 变量；返回 `Err` 表示材质失效/变量缺失，从活动表移除
+  - `bind(material)`：读写材质 VMT 变量；返回 `Err` 表示材质失效/变量缺失，本次跳过并记日志
   - `per_frame()`：是否每帧执行（依赖每帧变化的输入，如 `Sine` 输出，应覆写为 `true`）
 
 trait 定义（[`src/kv.rs`](src/kv.rs)）：
@@ -301,8 +347,8 @@ pub trait Proxy: Send {
 }
 ```
 
-> `bind` 返回 `Err` 时，`run_active_proxies` 会从**活动表移除**该条目 —— 防止材质被引擎
-> 卸载/替换后活动表持有悬垂指针导致 "No such variable" 刷屏或崩溃。
+> `bind` 返回 `Err` 时，`po_on_bind` 只记一条日志并跳过本次 —— 代理实例的生命周期完全由引擎
+> 的 `Release` 决定，不再有"从活动表移除"这一步（没有活动表了）。
 
 注册（泛型，见 [`src/lib.rs`](src/lib.rs) `try_bind_and_install`）：
 
@@ -374,9 +420,10 @@ material::register_proxy::<DelayAbortProxy>("l4nrp_delay_abort");
 > 再变不影响本次输出）。可选 `handle` 变量写出当前手柄（字符串类型，无计时器写空字符串），供
 > `l4nrp_delay_abort` 等代理中断。上升沿触发（需先回 0 再置位才重复触发）。
 >
-> 生命周期：计时器为全局注册表条目，与代理实例解耦。`DelaySetProxy` 实现了 `Drop` —— 代理离开活动表/
-> 被销毁时（`bind` 返回 `Err` 被移除、材质失效、插件卸载）统一调用 `abort_current` 取消挂起的计时器，
+> 生命周期：计时器为全局注册表条目，与代理实例解耦。`DelaySetProxy` 实现了 `Drop` —— 代理实例被销毁时
+> （引擎调 `Release` → `purge_released` 回收；或插件卸载）调用 `abort_current` 取消挂起的计时器，
 > 防止其在全局 `TIMERS` 表残留、到期访问已失效材质。
+> `bind` 返回 `Err` **不再**销毁代理（v0.7.0 起没有活动表），只跳过本次执行及其后的计时器驱动的输出。
 >
 > **`l4nrp_delay_abort` 中断计时器**：`trigger`（整型，`get_int`）非 0 时，读取 `handle` 变量
 > （字符串类型，`get_string`）指定的 UUID 手柄并调用 `material::abort_timer` 中断对应计时器
@@ -423,9 +470,10 @@ cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/e
 ## 已知问题
 
 - v6.0：**代理注册无法撤销**。`CMaterialProxyDict` 只有 CreateProxy / DeleteProxy / AddProxy
-  三个槽位，**没有"按名字删除"的接口**，所以插件析构时只能还原 D3D `EndScene` vtable 槽，
-  引擎侧的代理名字条目会留到进程结束。名字字符串也是 `Box::leak` 故意泄漏的（`AddProxy` 是否
-  复制名字未验证），泄漏量 = 15 个短字符串，可忽略。
+  三个槽位，**没有"按名字删除"的接口**，插件析构时**没有任何东西可以还原**（v0.7.0 起连 D3D
+  `EndScene` vtable 槽也不再改写，`dtor` 只记一条日志），引擎侧的代理名字条目会留到进程结束。
+  名字字符串也是 `Box::leak` 故意泄漏的（`AddProxy` 是否复制名字未验证），泄漏量 = 15 个短字符串，
+  可忽略。
 - v6.1：HUD 菜单 `"cvar"` 条目的**夹取方向未完全确定**。`FUN_10049350` 的越界分支在反编译里呈现为
   `if ((*(float*)(param_1+0x4c) + 1e-06 < local_30) || (local_30 < *(float*)(param_1+0x48) - 1e-06)) local_30 = *(float*)(param_1+0x4c);`
   —— `+0x48` / `+0x4c` 哪个是 `min`、哪个是 `max`，以及越界时夹到哪一端，未能完全确定。
@@ -435,8 +483,9 @@ cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/e
 - v6.2：**`material+0x23` / `material+0x28` 的读取时机**。这两个字段（代理计数 / 代理数组）
   由引擎在 `ParseProxies` **尾段**才写入；在 `FindMaterial` 刚返回时读到的仍是 0 / 空。
   排查问题时不要把它当成"注册失败"的证据。
-- v6.3：`REGISTRY` / `TIMERS` 相关的锁仍用 `.unwrap()`（历史遗留）。`panic = "abort"` 下
-  poison panic 会直接崩溃游戏；新代码一律用 `unwrap_or_else(|e| e.into_inner())`。
+- v6.3：**已修复（v0.7.0）**。曾有一批锁用 `.unwrap()`（`panic = "abort"` 下 poison panic 会直接
+  崩溃游戏），现已把 `REGISTRY` / `LIVE` / `TIMERS` 全部改为 `unwrap_or_else(|e| e.into_inner())`。
+  新代码必须沿用该写法。
 
 ## 历史方案（v1–v5，已废弃）
 
@@ -462,7 +511,9 @@ cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/e
 > **未命中再回退到引擎原生的 `client+0xa9570`**（= `GetProxyFactory()->CreateProxy(name)`）。
 > 所以只要注册进了 `CMaterialProxyDict` 且 `createFn` 返回非空，`l4n_is_proxy_exist` 就能查到。
 
-## 端到端实机验证记录（v6）
+## 端到端实机验证记录
+
+### v6：注册进引擎代理工厂
 
 用临时探针插件 `l4n_probe.dll`（只观察、不注册）+ 测试材质 `l4n/l4nrp_e2e_test.vmt` 在真实游戏中验证：
 
@@ -472,13 +523,36 @@ cargo test --lib        # 表达式求值器单元测试（[`src/expr.rs`](src/e
 | 不存在的名字 | `CreateProxy("__l4nrp_no_such_proxy__")` → `0x0`（对照正确） |
 | `l4n_is_proxy_exist` | 复刻其路径，6 个 `l4nrp_*` 全部返回非空（= 会打印 `exist!`） |
 | 引擎实例化 | 插件日志 `engine proxy: 'l4nrp_math' Init material=0x... per_frame=true` × 24 |
-| 生命周期 | `engine proxy: Release` 30+ 次；`purge_released` 正常回收（active 18→17→16…） |
-| **每帧驱动** | 测试 VMT 里的自增计数器 `$e2eWatch` 与 EndScene 帧计数**严格同步递增**（第 300 帧读到 297→298，第 600 帧读到 597→598） |
+| 生命周期 | `engine proxy: Release` 30+ 次；`purge_released` 正常回收（存活数 18→17→16…） |
+| 每帧驱动（旧） | 当时由 D3D9 `EndScene` hook 驱动：测试 VMT 的 `$e2eWatch` 与帧计数严格同步递增 |
 | 稳定性 | 多次运行无崩溃 |
 
-> 验证手法：`Start-Process left4dead2.exe -ArgumentList '-steam -insecure -language schinese
-> -heapsize 2097151 -novid -nojoy -noforcemaccel -noforcemspd -noforcemparms +exec autoexec.cfg'`
-> （`-insecure` 允许加载本地未签名插件），等 50–60 s 后检查 `MainWindowTitle` 是否为
+### v0.7.0：`OnBind` 驱动（零 hook）
+
+**不再使用探针** —— 直接用发布版插件 + addon VPK 覆盖一个真实会被绑定的材质
+（`models/weapons/melee/crowbar`；原材质在 `pak01` 内，addon VPK 优先级最高故能覆盖）：
+
+| 验证项 | 结果 |
+|---|---|
+| 注册 | 15 个代理全部注册，日志 `registered 15 proxies into CMaterialProxyDict` |
+| 引擎实例化 | `Init material=` 8 行，两个材质：`l4n/neko_tonemap`（`$l4nrpWt`）与 `crowbar`（`$l4nrpCb`） |
+| **每帧驱动** | `models/weapons/melee/crowbar` 上的 `$l4nrpCb` 由 `l4nrp_math { "expr" "l4nrpCb + 1" }` 自增，**完全由 `po_on_bind` 驱动、零 D3D hook**：两次运行分别递增到 **28995** 与 **4828** |
+| 无 D3D hook | 日志 `OnD3DDeviceCreated device=... is_dxvk=true (no D3D hook: OnBind-driven)`，运行中不触碰任何 D3D vtable 槽 |
+| 错误计数 | `bind failed` = 0、`not in registry` = 0、`Release` = 0、`panic`/`error`/`assert`/`overflow` = 0 |
+| 稳定性 | 无崩溃；两次运行均在数十秒后因 Steam 认证失败退出（`No Steam logon`，非崩溃），无新 `.mdmp`、无 WER 事件 |
+| 覆盖生效 | `console.log` 出现 `Error: Material "concrete/concrete_ext_15" uses unknown shader "L4nrpVpkMarkerShader"` → 证实 addon VPK 成功覆盖 `pak01` 材质 |
+
+> 验证手法（v0.7.0）：
+> ```powershell
+> $root='E:\SteamLibrary\steamapps\common\Left 4 Dead 2'
+> Start-Process -FilePath "$root\left4dead2.exe" -ArgumentList @('-steam','-language','schinese',
+>   '-heapsize','2097151','-novid','-nojoy','-noforcemaccel','-noforcemspd','-noforcemparms',
+>   '+exec','autoexec.cfg','-condebug','+map','c1m1_hotel') -WorkingDirectory $root -PassThru
+> ```
+> **不要加 `-insecure`**（会卡在 `Engine Error` 模态框）；`-WorkingDirectory $root` 使插件日志
+> 落在游戏根目录 `l4n_material_proxy_plugin.log`。等 50–60 s 后检查 `MainWindowTitle` 是否为
 > `Left 4 Dead 2 - Direct3D 9`（崩溃时是「哇袄！游戏爆炸了!」）。
-> **诊断读数必须与"测试材质确实被加载"同时成立才有意义** —— 曾因测试材质未被加载而看到
-> `active proxies: 0`，误判为"每帧驱动没跑"。
+> **诊断读数必须与"测试材质确实被加载"同时成立才有意义** —— 曾因测试材质未被加载
+> （`l4n/neko_tonemap` 从不进入代理分发列表）而看到 `po_on_bind` 命中 0 次，误判为"每帧驱动没跑"。
+> 让测试材质生效的正确做法是 **addon VPK**（`left4dead2/addons/*.vpk` 优先级高于 pak01 与 dlc），
+> 而不是 loose `left4dead2/materials/`（会输给 pak01/dlc VPK）。

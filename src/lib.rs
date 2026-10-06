@@ -75,7 +75,7 @@ fn log(msg: &str) {
     let line = format!("[l4n-proxy] {msg}\n");
     {
         let sink = LOG_SINK.get_or_init(|| Mutex::new(None));
-        let mut guard = sink.lock().unwrap();
+        let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             // 每次游戏运行（插件加载）首次写日志前，清空上一次运行留下的日志文件。
             *guard = std::fs::File::create("l4n_material_proxy_plugin.log")
@@ -109,7 +109,7 @@ static VERSION: &CStr = {
 };
 
 unsafe extern "thiscall" fn dtor(_this: *mut L4NPlugin) {
-    material::uninstall();
+    log("dtor: plugin unloaded (engine-owned proxy objects remain registered)");
 }
 /// 返回本插件实现的接口版本。left4neko 的插件加载器把这个返回值存进插件表
 /// （每项 12 字节：`{+0, +4 实例指针, +8 版本号}`），`PluginManager::BuildHudMenu`
@@ -202,17 +202,14 @@ unsafe extern "thiscall" fn on_d3d_device_created(
     device: *mut c_void,
     is_dxvk: u8,
 ) {
-    log(&format!("OnD3DDeviceCreated device=0x{:x} is_dxvk={}", device.addr(), is_dxvk != 0));
-    match material::install_d3d_endscene(device) {
-        Ok(()) => log(&format!(
-            "D3D EndScene hook installed (device=0x{:x})",
-            device.addr()
-        )),
-        Err(e) => log(&format!(
-            "D3D EndScene hook error: {}",
-            e
-        ))
-    }
+    // 路线 A：不再 hook D3D `EndScene`。per-frame 代理由引擎的材质绑定路径驱动
+    // （`CMaterial::vtable[0xd0]` → 代理对象 `vtable[+4]` = `po_on_bind`），
+    // 与设备重建 / DXVK 解耦，本回调只记日志。
+    log(&format!(
+        "OnD3DDeviceCreated device=0x{:x} is_dxvk={} (no D3D hook: OnBind-driven)",
+        device.addr(),
+        is_dxvk != 0
+    ));
 }
 
 /// `IL4NPlugin::RequestHudMenu`（接口版本 2 新增，虚表槽位 8 / 字节偏移 `0x20`）。
